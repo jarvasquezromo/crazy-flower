@@ -42,6 +42,20 @@ import cflib.crtp  # noqa
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.utils import uri_helper
+import numpy as np
+
+gates = [
+    [-1.6, 0, 0],
+    [-1.6, 0, 1.5],
+    [-0.55, -1.07, 1.58],
+    [0.9, -1.22, 1.83],
+    [1.77, -0.0, 1.54],
+    [0.66, 0.73, 1.42],
+    [-0.55, 1.07, 1.9],
+    [-1, 1.5, 2],
+    [-1, 1.5, 0],
+]
+
 
 # TODO: CHANGE THIS URI TO YOUR CRAZYFLIE & YOUR RADIO CHANNEL
 uri = uri_helper.uri_from_env(default='radio://0/70/2M/E7E7E7E705')
@@ -119,10 +133,10 @@ class LoggingExample:
         """Callback from a the log API when data arrives"""
 
         # Print the data to the console
-        print(f'[{timestamp}][{logconf.name}]: ', end='')
-        for name, value in data.items():
-            print(f'{name}: {value:3.3f} ', end='')
-        print()
+        # print(f'[{timestamp}][{logconf.name}]: ', end='')
+        # for name, value in data.items():
+        #     print(f'{name}: {value:3.3f} ', end='')
+        # print()
 
     def _connection_failed(self, link_uri, msg):
         """Callback when connection initial connection fails (i.e no Crazyflie
@@ -157,6 +171,27 @@ def emergency_stop_callback(cf):
     with keyboard.Listener(on_press=on_press) as listener:
         listener.join()
 
+def interpolate(p0, p1, steps):
+    p0 = np.array(p0)
+    p1 = np.array(p1)
+    for i in range(steps + 1):
+        t = i / steps
+        yield (1 - t) * p0 + t * p1
+
+def fly_through_waypoints(cf, gates, steps=50, delay=0.05):
+    for a in range(len(gates) - 1):
+        p0 = gates[a]
+        p1 = gates[a + 1]
+
+        for point in interpolate(p0, p1, steps):
+            cf.commander.send_position_setpoint(
+                float(point[0]),
+                float(point[1]),
+                float(point[2]),
+                0  # yaw
+            )
+            time.sleep(delay)
+
 if __name__ == '__main__':
     # Initialize the low-level drivers
     cflib.crtp.init_drivers()
@@ -179,28 +214,8 @@ if __name__ == '__main__':
         time.sleep(0.01)
         
         # Take-off
-        for y in range(10):
-            cf.commander.send_hover_setpoint(0, 0, 0, y / 25)
-            time.sleep(0.1)
-        for _ in range(20):
-            cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
-            time.sleep(0.1)
-
-        # Move 
-        for _ in range(50):
-            cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
-            time.sleep(0.1)
-        for _ in range(50):
-            cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
-            time.sleep(0.1)
-
-        # Land
-        for _ in range(20):
-            cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
-            time.sleep(0.1)
-        for y in range(10):
-            cf.commander.send_hover_setpoint(0, 0, 0, (10 - y) / 25)
-            time.sleep(0.1)
+        
+        fly_through_waypoints(cf, gates)
 
         cf.commander.send_stop_setpoint()
         break
