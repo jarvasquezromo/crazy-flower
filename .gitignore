@@ -223,4 +223,6 @@ __marimo__/
 # cache
 */cache/
 */snapshots.csv
+*/recordings/
+.test/
 
