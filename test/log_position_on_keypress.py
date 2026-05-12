@@ -42,14 +42,15 @@ OUTPUT_FILE    = 'snapshots.csv'
 VARIABLES      = ['stateEstimate.x', 'stateEstimate.y',
                   'stateEstimate.z', 'stabilizer.yaw']
 SHORT_NAMES    = ['x', 'y', 'z', 'yaw']   # used in CSV headers
+VAR_ACCEPTED   = [0.01, 0.01, 0.01, 0.1]
 
 logging.basicConfig(level=logging.ERROR)
 
 # ── Statistics helpers ────────────────────────────────────────────────────────
 
-def stats(samples: list[dict], key: str) -> tuple[float, float]:
+def stats(samples: list[dict], key: str, num_dig: int=3) -> tuple[float, float]:
     vals = [s[key] for s in samples]
-    return np.mean(vals), np.std(vals)
+    return np.mean(vals).round(num_dig), np.std(vals).round(num_dig + 1)
 
 # ── CSV output ────────────────────────────────────────────────────────────────
 
@@ -75,18 +76,19 @@ def write_snapshot(snapshot_id: int, trigger_ts: float,
                'trigger_timestamp': f'{trigger_ts:.3f}'}
 
         for var, name in zip(VARIABLES, SHORT_NAMES):
-            m_all, v_all = stats(all_samples, var)
-            row[f'{name}_mean']    = f'{m_all:.6f}'
-            row[f'{name}_var']     = f'{v_all:.6f}'
+            m_all, v_all = stats(all_samples, var, num_dig=3)
+            row[f'{name}_mean']    = f'{m_all:.2f}'
+            row[f'{name}_var']     = f'{v_all:.3f}'
 
         writer.writerow(row)
 
-    # Pretty-print to terminal
-    print(f'\n── Snapshot #{snapshot_id} saved (trigger @ {trigger_ts:.3f}s) ──')
-    print(f'  {"Variable":<6} {"mean":>12}  {"var":>12}')
-    for var, name in zip(VARIABLES, SHORT_NAMES):
-        m_all, v_all = stats(all_samples, var)
-        print(f'  {name:<6}  {m_all:>12.4f}  {v_all:>12.6f}')
+        # Pretty-print to terminal
+        print(f'\n── Snapshot #{snapshot_id} saved (trigger @ {trigger_ts:.3f}s) ──')
+        print(f'  {"Variable":<6} {"mean":>10} {"var":>10} {"check":>10}')
+        for i, var, name in zip(range(len(VAR_ACCEPTED)), VARIABLES, SHORT_NAMES):
+            names = (name + '_mean', name + '_var')
+            check = '✔' if VAR_ACCEPTED[i] >= float(row[names[1]]) else '✘'
+            print(f"  {name:<6} {row[names[0]]:>12s} {row[names[1]]:>12s} {check:>6}")
     print(f'  → appended to {OUTPUT_FILE}\n')
 
 # ── Main logger class ─────────────────────────────────────────────────────────
