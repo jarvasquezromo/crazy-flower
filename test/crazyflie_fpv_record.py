@@ -17,19 +17,23 @@ What happens when this script runs:
     run may still be alive. See the FAQ for how to free the port on your OS.
 
 Keys:  arrows = pitch/roll,  A/D = yaw,  W/S = up/down,  Space = stop.
+       R = start recording,  E = stop recording and save.
 """
-import contextlib
 import os
+import cv2
+import sys
+import time
 import socket
 import struct
-import sys
+import datetime
+import contextlib
+import numpy as np
 
 import cflib.crtp
-import cv2
-import numpy as np
 from cflib.crazyflie import Crazyflie
-from PyQt6 import QtCore, QtGui, QtWidgets
+from cflib.crazyflie.log import LogConfig
 
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 @contextlib.contextmanager
 def _muted_stderr():
@@ -57,6 +61,10 @@ IMG_HEADER_SIZE  = 11
 IMG_WIDTH        = 324
 IMG_HEIGHT       = 244
 MIN_JPEG_BYTES   = 5000
+
+# --- Recording settings ---
+RECORDING_FPS     = 10       # Approximate FPS for the saved video
+RECORDINGS_DIR    = 'recordings'  # Folder where videos will be saved
 
 
 class UdpVideoThread(QtCore.QThread):
@@ -123,12 +131,23 @@ class FPVWindow(QtWidgets.QWidget):
 
         self.image_label = QtWidgets.QLabel('Waiting for video...')
         self.status_label = QtWidgets.QLabel(f'Connecting to {URI}...')
+        self.record_label = QtWidgets.QLabel('')
+        self.battery_label = QtWidgets.QLabel('')
+        self.record_label.setStyleSheet('color: red; font-weight: bold;')
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(self.image_label)
+        layout.addWidget(self.record_label)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.battery_label)
 
         self.hover = {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'height': 0.3}
         self._held = set()
+
+        # --- Recording state ---
+        self._video_writer = None
+        self._is_recording = False
+        os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
         self.video = UdpVideoThread(self)
         self.video.frame_ready.connect(self._show_frame)
@@ -144,10 +163,38 @@ class FPVWindow(QtWidgets.QWidget):
         self._timer.timeout.connect(self._send_setpoint)
         self._timer.setInterval(100)
 
+        self._last_battery_level = None
+        self.fly_mode = False
+
     def _on_connected(self, uri):
-        self.status_label.setText(f'Connected to {uri}')
+        self.status_label.setText(f'Connected to {uri}  |  R = record  |  E = stop & save')
         self.cf.supervisor.send_arming_request(True)
         self._timer.start()
+
+        self._setup_battery_logging()
+        self._start_time = time.time()
+
+    def _battery_callback(self, timestamp, data, logconf):
+        vbat = data['pm.vbat']
+        if self._last_battery_level is None:
+            print (f"Battery: {vbat:.2f}V")
+        self._last_battery_level = vbat
+
+    def _setup_battery_logging(self):
+        # Create a log configuration with a 1-second (1000ms) period
+        log_conf = LogConfig(name='Battery', period_in_ms=1000)
+        log_conf.add_variable('pm.vbat', 'float')
+        
+        try:
+            self.cf.log.add_config(log_conf)
+            # Register the callback
+            log_conf.data_received_cb.add_callback(self._battery_callback)
+            # Start the logging
+            log_conf.start()
+        except KeyError as e:
+            print(f'Could not setup log configuration: {str(e)}')
+        except AttributeError:
+            print('Crazyflie not connected or TOC not downloaded')
 
     def _show_frame(self, img):
         if img.ndim == 2:
@@ -158,11 +205,57 @@ class FPVWindow(QtWidgets.QWidget):
             qimg = QtGui.QImage(img.data, w, h, w * 3, QtGui.QImage.Format.Format_RGB888)
         self.image_label.setPixmap(QtGui.QPixmap.fromImage(qimg.scaled(w * 2, h * 2)))
 
+        # Feed the current frame into the video writer if recording
+        if self._is_recording and self._video_writer is not None:
+            # VideoWriter expects BGR; img is RGB (or grayscale)
+            if img.ndim == 2:
+                frame_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            else:
+                frame_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            self._video_writer.write(frame_bgr)
+
+        if self._last_battery_level is not None:
+            self.battery_label.setText(f"Battery: {self._last_battery_level:.2f}V")
+
+    def _start_recording(self):
+        if self._is_recording:
+            return  # Already recording
+
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        filepath = os.path.join(RECORDINGS_DIR, f'fpv_{timestamp}.mp4')
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self._video_writer = cv2.VideoWriter(
+            filepath, fourcc, RECORDING_FPS, (IMG_WIDTH, IMG_HEIGHT))
+
+        if not self._video_writer.isOpened():
+            self.status_label.setText('ERROR: Could not open video writer.')
+            self._video_writer = None
+            return
+
+        self._is_recording = True
+        self._current_recording_path = filepath
+        self.record_label.setText(f'● REC  →  {filepath}')
+        self.status_label.setText('Recording…  Press E to stop and save.')
+
+    def _stop_recording(self):
+        if not self._is_recording:
+            return  # Not currently recording
+
+        self._is_recording = False
+        if self._video_writer is not None:
+            self._video_writer.release()
+            self._video_writer = None
+
+        self.record_label.setText('')
+        self.status_label.setText(
+            f'Saved: {self._current_recording_path}  |  R = record  |  E = stop & save')
+
     def _send_setpoint(self):
-        # self.cf.commander.send_hover_setpoint(
-        #     self.hover['x'], self.hover['y'],
-        #     self.hover['yaw'], self.hover['height'])
-        pass
+        if self.fly_mode:
+            self.cf.commander.send_hover_setpoint(
+                self.hover['x'], self.hover['y'],
+                self.hover['yaw'], self.hover['height'])
 
     def _update_velocity(self):
         K = QtCore.Qt.Key
@@ -176,12 +269,19 @@ class FPVWindow(QtWidgets.QWidget):
             return
         k = event.key()
         if k == QtCore.Qt.Key.Key_Space:
-            self.cf.commander.send_stop_setpoint()
-            self._timer.stop()
+            if self.fly_mode:
+                self.cf.commander.send_stop_setpoint()
+                self._timer.stop()
+            else:
+                self.fly_mode = True
         elif k == QtCore.Qt.Key.Key_W:
             self.hover['height'] += 0.1
         elif k == QtCore.Qt.Key.Key_S:
             self.hover['height'] -= 0.1
+        elif k == QtCore.Qt.Key.Key_R:
+            self._start_recording()
+        elif k == QtCore.Qt.Key.Key_E:
+            self._stop_recording()
         else:
             self._held.add(k)
             self._update_velocity()
@@ -193,7 +293,14 @@ class FPVWindow(QtWidgets.QWidget):
         self._update_velocity()
 
     def closeEvent(self, event):
+        if self._last_battery_level is not None:
+            print(f"Battery: {self._last_battery_level:.2f}V")
+        print (f"Time of connection: {time.time() - self._start_time:.2f} seg")
+
         self._timer.stop()
+        # Ensure any active recording is cleanly saved on window close
+        if self._is_recording:
+            self._stop_recording()
         self.cf.commander.send_stop_setpoint()
         self.cf.close_link()
         event.accept()
