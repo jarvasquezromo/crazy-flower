@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import contextlib
+import json
 import logging
 import os
 import socket
@@ -31,9 +32,79 @@ SPEED = 0.6
 CPX_HEADER_SIZE = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE = 11
-IMG_WIDTH = 324
-IMG_HEIGHT = 244
 MIN_JPEG_BYTES = 5000
+CALIBRATION_PATH = os.path.join(os.path.dirname(__file__), 'calibration.json')
+
+
+def _load_calibration():
+    with open(CALIBRATION_PATH, 'r', encoding='utf-8') as f:
+        calib = json.load(f)
+    required = ('img_w', 'img_h', 'fx', 'fy', 'cx', 'cy', 'dist_coeffs')
+    missing = [key for key in required if key not in calib]
+    if missing:
+        raise ValueError(f"Missing calibration keys in {CALIBRATION_PATH}: {missing}")
+    return calib
+
+
+def _scaled_calibration(calib, img_w, img_h):
+    sx = float(img_w) / float(calib['img_w'])
+    sy = float(img_h) / float(calib['img_h'])
+    scaled = dict(calib)
+    scaled['img_w'] = int(img_w)
+    scaled['img_h'] = int(img_h)
+    scaled['fx'] = float(calib['fx']) * sx
+    scaled['fy'] = float(calib['fy']) * sy
+    scaled['cx'] = float(calib['cx']) * sx
+    scaled['cy'] = float(calib['cy']) * sy
+    scaled['fov_h_deg'] = float(np.degrees(2.0 * np.arctan(img_w / (2.0 * scaled['fx']))))
+    scaled['fov_v_deg'] = float(np.degrees(2.0 * np.arctan(img_h / (2.0 * scaled['fy']))))
+    return scaled
+
+
+BASE_CALIBRATION = _load_calibration()
+CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
+IMG_WIDTH = int(CAMERA_CALIBRATION['img_w'])
+IMG_HEIGHT = int(CAMERA_CALIBRATION['img_h'])
+CAMERA_FX = float(CAMERA_CALIBRATION['fx'])
+CAMERA_FY = float(CAMERA_CALIBRATION['fy'])
+CAMERA_CX = float(CAMERA_CALIBRATION['cx'])
+CAMERA_CY = float(CAMERA_CALIBRATION['cy'])
+DIST_COEFFS = np.array(CAMERA_CALIBRATION['dist_coeffs'], dtype=np.float64)
+
+
+def _set_runtime_calibration(img_w, img_h):
+    global CAMERA_CALIBRATION, IMG_WIDTH, IMG_HEIGHT, CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY, DIST_COEFFS
+
+    if img_w == int(BASE_CALIBRATION['img_w']) and img_h == int(BASE_CALIBRATION['img_h']):
+        CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
+        print(f"Radio image size OK: {img_w}x{img_h} matches calibration.json")
+    else:
+        CAMERA_CALIBRATION = _scaled_calibration(BASE_CALIBRATION, img_w, img_h)
+        print(
+            f"Radio image size {img_w}x{img_h} differs from calibration.json "
+            f"{BASE_CALIBRATION['img_w']}x{BASE_CALIBRATION['img_h']}; scaled calibration in memory"
+        )
+
+    IMG_WIDTH = int(CAMERA_CALIBRATION['img_w'])
+    IMG_HEIGHT = int(CAMERA_CALIBRATION['img_h'])
+    CAMERA_FX = float(CAMERA_CALIBRATION['fx'])
+    CAMERA_FY = float(CAMERA_CALIBRATION['fy'])
+    CAMERA_CX = float(CAMERA_CALIBRATION['cx'])
+    CAMERA_CY = float(CAMERA_CALIBRATION['cy'])
+    DIST_COEFFS = np.array(CAMERA_CALIBRATION['dist_coeffs'], dtype=np.float64)
+
+
+def _camera_matrix():
+    return np.array(
+        [[CAMERA_FX, 0.0, CAMERA_CX], [0.0, CAMERA_FY, CAMERA_CY], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _undistort_image(rgb_img):
+    if DIST_COEFFS.size == 0 or np.allclose(DIST_COEFFS, 0.0):
+        return rgb_img
+    return cv2.undistort(rgb_img, _camera_matrix(), DIST_COEFFS)
 
 # --- Gate detection / control tuning ---
 # HSV ranges for "green" can vary a lot with exposure/white balance.
@@ -65,7 +136,6 @@ MAX_DH_PER_S = 0.6           # max height change rate
 MORPH_KERNEL = np.ones((5, 5), np.uint8)
 
 # --- Camera / world-frame projection ---
-CAMERA_FOV_H   = np.deg2rad(87.0)   # AI-deck color camera horizontal FoV (datasheet: H=87°)
 GATE_PHYS_W    = 0.8                 # metres, physical gate width for distance estimate
 TRAJ_N_STEPS   = 5                   # number of waypoints in interpolated trajectory
 TRAJ_OVERSHOOT = 0.30                # metres past gate centre (to fly through cleanly)
@@ -135,8 +205,8 @@ def _detect_green_gate(rgb_img):
         cx = float(m["m10"] / m["m00"])
         cy = float(m["m01"] / m["m00"])
 
-    ex = (cx - 0.5 * w) / max(0.5 * w, 1.0)
-    ey = (cy - 0.5 * h) / max(0.5 * h, 1.0)
+    ex = (cx - CAMERA_CX) / max(0.5 * w, 1.0)
+    ey = (cy - CAMERA_CY) / max(0.5 * h, 1.0)
 
     return {
         "found": True,
@@ -152,6 +222,12 @@ def _detect_green_gate(rgb_img):
 
 class UdpVideoThread(QtCore.QThread):
     frame_ready = QtCore.pyqtSignal(np.ndarray)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._expected_w = IMG_WIDTH
+        self._expected_h = IMG_HEIGHT
+        self._printed_size = False
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -171,7 +247,12 @@ class UdpVideoThread(QtCore.QThread):
 
             if len(payload) >= IMG_HEADER_SIZE and payload[0] == IMG_HEADER_MAGIC:
                 _, w, h, _, _, size = struct.unpack('<BHHBBI', payload[:IMG_HEADER_SIZE])
-                if w == IMG_WIDTH and h == IMG_HEIGHT and 0 < size < 65536:
+                if 0 < w and 0 < h and 0 < size < 65536:
+                    self._expected_w = int(w)
+                    self._expected_h = int(h)
+                    if not self._printed_size:
+                        _set_runtime_calibration(self._expected_w, self._expected_h)
+                        self._printed_size = True
                     expected_size = size
                     buffer = bytearray()
                     receiving = True
@@ -197,7 +278,13 @@ class UdpVideoThread(QtCore.QThread):
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None or img.shape[:2] != (IMG_HEIGHT, IMG_WIDTH):
+        if img is None:
+            return
+        if img.shape[:2] != (self._expected_h, self._expected_w):
+            print(
+                f"Decoded radio image has wrong size: got {img.shape[1]}x{img.shape[0]}, "
+                f"expected {self._expected_w}x{self._expected_h}"
+            )
             return
         if img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -264,6 +351,7 @@ class FPVWindow(QtWidgets.QWidget):
             color = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         else:
             color = img
+        color = _undistort_image(color)
 
         det = _detect_green_gate(color)
         with self._vision_lock:
@@ -442,13 +530,13 @@ class FPVWindow(QtWidgets.QWidget):
         """Project image-plane gate centre + bbox width to a world-frame point."""
         bw = bbox[2]
         # Pinhole distance estimate: dist = (physical_width * focal_px) / bbox_px
-        focal_px = IMG_WIDTH / (2.0 * np.tan(CAMERA_FOV_H / 2.0))
-        dist = max((GATE_PHYS_W * focal_px) / max(bw, 1), 0.3)
-        fov_v = CAMERA_FOV_H * IMG_HEIGHT / IMG_WIDTH
+        dist = max((GATE_PHYS_W * CAMERA_FX) / max(bw, 1), 0.3)
+        x_err_px = ex * max(0.5 * IMG_WIDTH, 1.0)
+        y_err_px = ey * max(0.5 * IMG_HEIGHT, 1.0)
         # Body-frame offsets (camera looks along +body_x)
         dx_b =  dist
-        dy_b = -ex * dist * np.tan(CAMERA_FOV_H / 2.0)
-        dz_b = -ey * dist * np.tan(fov_v / 2.0)
+        dy_b = -x_err_px * dist / CAMERA_FX
+        dz_b = -y_err_px * dist / CAMERA_FY
         with self._pos_lock:
             yaw_r = np.deg2rad(self._est['yaw'])
             ox, oy, oz = self._est['x'], self._est['y'], self._est['z']

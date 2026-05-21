@@ -46,8 +46,8 @@ IMG_W, IMG_H = 324, 324
 MIN_JPEG     = 5000
 
 # ── Checkerboard defaults ─────────────────────────────────────────────────────
-DEFAULT_COLS   = 10     # inner corners, horizontal
-DEFAULT_ROWS   = 7      # inner corners, vertical
+DEFAULT_COLS   = 9     # inner corners, horizontal
+DEFAULT_ROWS   = 6      # inner corners, vertical
 DEFAULT_SQ_MM  = 21.0   # physical square size in millimetres
 MIN_FRAMES     = 10     # minimum captured frames before calibration is allowed
 
@@ -222,30 +222,53 @@ def main():
         if img_size is None:
             img_size = (frame.shape[1], frame.shape[0])
 
-        # --- Pre-process: adaptive contrast ---
+        # --- Pre-process: adaptive contrast + smoothing ---
         proc = clahe.apply(frame)
+        blur = cv2.GaussianBlur(proc, (5, 5), 0)
 
         # --- Detect on upscaled image, then scale corners back ---
-        h, w = proc.shape[:2]
-        big  = cv2.resize(proc, (w * DETECT_SCALE, h * DETECT_SCALE),
+        h, w = blur.shape[:2]
+        big  = cv2.resize(blur, (w * DETECT_SCALE, h * DETECT_SCALE),
                           interpolation=cv2.INTER_LINEAR)
+        # Block size must cover ~1/3 of a square width on the upscaled image.
+        # 10-col board in 324px → square ≈ 29px → ×2 upscale → 58px → block ≈ 21.
+        thr  = cv2.adaptiveThreshold(big, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                     cv2.THRESH_BINARY, 21, 5)
         found, corners_big = cv2.findChessboardCorners(big, board, det_flags)
         corners = None
         if found:
             corners = corners_big / DETECT_SCALE
-            corners = cv2.cornerSubPix(proc, corners, (11, 11), (-1, -1), criteria)
+            corners = cv2.cornerSubPix(blur, corners, (11, 11), (-1, -1), criteria)
 
+        # --- Main display ---
         disp = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         if found and corners is not None:
             cv2.drawChessboardCorners(disp, board, corners, found)
 
-        rms_str = (f"  RMS={last_calib['rms_px']:.3f}px" if last_calib else "")
+        rms_str   = (f"  RMS={last_calib['rms_px']:.3f}px" if last_calib else "")
         board_str = "[board found]" if found else "[no board]"
-        col       = (0, 220, 0)    if found else (0, 80, 255)
+        col       = (0, 220, 0) if found else (0, 80, 255)
         status    = f"Captured: {len(obj_pts)}/{MIN_FRAMES}  {board_str}{rms_str}"
         cv2.putText(disp, status, (6, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
         cv2.imshow('Calibration — AI-deck', disp)
+
+        # --- Debug window: 4 panels at uniform size ---
+        # Shows each stage so you can see where detection breaks down.
+        dw, dh = w, h   # display size per panel = original frame size
+        def _panel(img_gray, label):
+            p = cv2.resize(img_gray, (dw, dh), interpolation=cv2.INTER_AREA)
+            p = cv2.cvtColor(p, cv2.COLOR_GRAY2BGR)
+            cv2.putText(p, label, (4, 14), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4, (0, 220, 255), 1, cv2.LINE_AA)
+            return p
+        row = np.hstack([
+            _panel(frame, '1-raw'),
+            _panel(blur,  '2-CLAHE+blur'),
+            _panel(big,   f'3-upscale x{DETECT_SCALE}'),
+            _panel(thr,   '4-adaptive thr (detector view)'),
+        ])
+        cv2.imshow('Debug — calibration pipeline', row)
 
         key = cv2.waitKey(delay_ms) & 0xFF
 
