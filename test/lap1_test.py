@@ -133,7 +133,7 @@ MAX_HEIGHT = 2.0             # meters (safety clamp)
 K_HEIGHT = 1.2               # (m/s) per normalized vertical error
 MAX_DH_PER_S = 0.6           # max height change rate
 
-MORPH_KERNEL = np.ones((5, 5), np.uint8)
+MORPH_KERNEL = np.ones((9, 9), np.uint8)
 
 # --- Camera / world-frame projection ---
 GATE_PHYS_W    = 0.8                 # metres, physical gate width for distance estimate
@@ -162,23 +162,19 @@ def _detect_green_gate(rgb_img):
     """Return detection dict {found, cx, cy, area, bbox, ex, ey} from an RGB image."""
     """
     It works this way : 
-    1. Convert the RGB image to HSV color space.
-    2. Create a binary mask where the green pixels are white and the rest are black
-    3. Apply morphological operations to clean up the mask.
+    1. Convert the RGB image to grayscale.
+    2. Create a binary mask where bright pixels are white and the rest are black.
+    3. Apply morphological close to clean up the mask.
     4. Find contours in the mask and select the largest one as the detected gate.
     5. Calculate the center of the detected gate and the error from the image center.
     6. Return a dictionary with the detection results.
     """
     
     h, w = rgb_img.shape[:2]
-    hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
-    mask = cv2.inRange(hsv, GREEN_HSV_LO, GREEN_HSV_HI)
-    if GREEN_MIN_V is not None and GREEN_MIN_V > 0:
-        v = hsv[:, :, 2]
-        v_mask = np.where(v >= GREEN_MIN_V, np.uint8(255), np.uint8(0))
-        mask = cv2.bitwise_and(mask, v_mask)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=2)
+    gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
+    threshold = max(int(GREEN_HSV_LO[2]), int(GREEN_MIN_V) if GREEN_MIN_V is not None else 0)
+    mask = np.where(gray >= threshold, np.uint8(255), np.uint8(0))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=3)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
