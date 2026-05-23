@@ -181,14 +181,14 @@ PUSH_DURATION_S = 1.0
 SEARCH_HEIGHT = 0.8          # meters, target height for search/center
 TAKEOFF_START_HEIGHT = 0.1   # meters, initial setpoint at takeoff
 TAKEOFF_RATE = 0.4           # m/s climb rate during takeoff ramp
-MAX_GATES = 4
+MAX_GATES = 5
 
 MIN_HEIGHT = 0.2             # meters (safety clamp)
 MAX_HEIGHT = 2.0             # meters (safety clamp)
 K_HEIGHT = 1.2               # (m/s) per normalized vertical error
 MAX_DH_PER_S = 0.6           # max height change rate
 
-MORPH_KERNEL = np.ones((3, 3), np.uint8)
+MORPH_KERNEL = np.ones((5, 5), np.uint8)
 
 # --- Gate-shape acceptance thresholds (a gate is a roughly-square quad frame) ---
 GATE_MIN_VERTICES = 4      # quad after polygon approximation
@@ -600,8 +600,8 @@ class FPVWindow(QtWidgets.QWidget):
                 self._state_t0   = now
 
         self._pos['z'] = float(np.clip(self._pos['z'], MIN_HEIGHT, MAX_HEIGHT))
-        self.cf.commander.send_position_setpoint(
-            self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'])
+        #self.cf.commander.send_position_setpoint(
+        #    self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'])
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat():
