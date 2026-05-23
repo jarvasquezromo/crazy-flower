@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
-"""Offline video tester for the green-gate detector + simple state machine.
+"""Offline video tester for the lap1_test.py gate detector + state machine.
 
-This is meant to be the "same kind" of workflow as test_video.py but for the
-lap1 green gate logic:
-- Load an MP4
-- Scrub frames
-- Tune HSV / min-V thresholds
-- Visualize mask + overlay
-- Simulate SEARCH/CENTER/PUSH commands (yaw / lateral / height)
+Loads a recorded MP4 and replays the *exact same* detection and autonomy logic
+that lap1_test.py runs on the real Crazyflie, so the pipeline can be tuned and
+validated frame-by-frame without flying.
+
+Detection (shared with lap1_test.py)
+  - Threshold bright pixels into a mask, morphologically close it.
+  - Validate each contour as a gate-shaped polygon (approxPolyDP vertex count,
+    aspect ratio, solidity); the centre is the polygon's area centroid.
+  - Keep all candidates, select the rightmost; project it to a world point via
+    a pinhole model (gate_to_world) using the (simulated) drone pose.
+
+State machine (mirrors lap1_test.py, simulated offline)
+  WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> (repeat) -> DONE
+  Detection comes from the real video frame each step; the drone pose is
+  *simulated* by integrating the commanded position setpoints (there is no real
+  Kalman estimate offline), so CHASE trajectory-following and the PUSH-through
+  reset can be observed. See GateController for the per-state behaviour.
+
+GUI
+  Left: BW overlay with candidate polygons (rightmost = green). Right: mask.
+  Sliders tune detection thresholds and a few control params; Prev/Next/Play
+  scrub the video and Reset re-initialises the state machine.
 
 Usage:
   python3 crazy-flower/test/test_gate_video.py --video Video/First_try.mp4
@@ -30,6 +45,27 @@ PROCESS_FPS = 2.0
 
 GATE_PHYS_W  = 0.8               # metres, physical gate width
 CAMERA_FOV_H = np.deg2rad(87.0)  # AI-deck color camera H FoV (datasheet); overridden by calib file
+
+# --- Control / state-machine tuning (mirrors lap1_test.py) ---
+SEARCH_YAWRATE       = -20.0     # deg/s, yaw-in-place scan rate during SEARCH
+SEARCH_HEIGHT        = 0.8       # metres, target height for search/chase
+TAKEOFF_START_HEIGHT = 0.1       # metres, initial setpoint at takeoff
+TAKEOFF_RATE         = 0.4       # m/s climb rate during the takeoff ramp
+FORWARD_SPEED        = 0.35      # m/s body-X push speed
+PUSH_DURATION_S      = 1.0       # seconds to commit straight through a gate
+MAX_GATES            = 4         # stop (DONE) after this many gates
+MIN_HEIGHT           = 0.2       # metres, safety clamp
+MAX_HEIGHT           = 2.0       # metres, safety clamp
+CHASE_TIMEOUT        = 8.0       # seconds before giving up and returning to SEARCH
+PASS_AREA_FRAC       = 0.25      # gate bbox / image area threshold -> commit PUSH
+GATE_EMA_ALPHA       = 0.35      # EMA weight for refining the locked gate position
+TRAJ_N_STEPS         = 5         # waypoints in the interpolated trajectory
+TRAJ_OVERSHOOT       = 0.30      # metres past gate centre (fly through cleanly)
+WAYPOINT_TOL         = 0.15      # metres, advance to next waypoint within this radius
+
+# Offline-only: how fast the simulated pose tracks the commanded setpoint.
+SIM_MAX_SPEED        = 0.8       # m/s
+SIM_MAX_YAWRATE      = 90.0      # deg/s
 
 
 def load_calibration(path):
@@ -110,15 +146,17 @@ class VideoFrameStore:
             self.cap.release()
 
 
-def detect_green_gate(rgb_img, hsv_lo, hsv_hi, min_v, min_area_frac, kernel_size=9, *, use_bw=False):
-    """Return detection dict and mask.
+# --- Gate-shape acceptance thresholds (a gate is a roughly-square quad frame) ---
+GATE_MIN_VERTICES = 4      # quad after polygon approximation
+GATE_MAX_VERTICES = 8      # allow a few extra vertices from noise / rounded corners
+GATE_ASPECT_MIN   = 0.45   # bbox w/h: tolerate perspective foreshortening
+GATE_ASPECT_MAX   = 2.2
+GATE_MIN_SOLIDITY = 0.80   # area / convex-hull area: frame outline is near-convex
+GATE_APPROX_EPS   = 0.04   # approxPolyDP epsilon, fraction of perimeter
 
-    If use_bw=True, detection runs on a black & white (intensity) version of the image.
-    In that mode, the HSV bounds are not meaningful; we reuse V thresholds as an
-    intensity threshold.
-    """
-    h, w = rgb_img.shape[:2]
 
+def _build_mask(rgb_img, hsv_lo, hsv_hi, min_v, kernel_size, use_bw):
+    """Threshold + morphological cleanup. Returns a uint8 0/255 mask."""
     if use_bw:
         gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
         v_lo = int(hsv_lo[2]) if hsv_lo is not None else 0
@@ -127,7 +165,6 @@ def detect_green_gate(rgb_img, hsv_lo, hsv_hi, min_v, min_area_frac, kernel_size
     else:
         hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
         mask = cv2.inRange(hsv, hsv_lo, hsv_hi)
-
         if min_v is not None and min_v > 0:
             v = hsv[:, :, 2]
             v_mask = np.where(v >= int(min_v), np.uint8(255), np.uint8(0))
@@ -137,119 +174,260 @@ def detect_green_gate(rgb_img, hsv_lo, hsv_hi, min_v, min_area_frac, kernel_size
     if k % 2 == 0:
         k += 1
     kernel = np.ones((k, k), np.uint8)
-    # mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    return mask
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return {"found": False}, mask
 
-    img_area = float(h * w)
-    best = max(contours, key=cv2.contourArea)
-    best_area = float(cv2.contourArea(best))
+def _gate_candidate(cnt, img_w, img_h, min_area_frac):
+    """Validate a contour as a gate-shaped polygon.
 
-    if best_area < float(min_area_frac) * img_area:
-        return {"found": False}, mask
+    Returns a candidate dict if the contour passes the shape tests, else None.
+    """
+    area = float(cv2.contourArea(cnt))
+    if area < float(min_area_frac) * float(img_w * img_h):
+        return None
 
-    x, y, bw, bh = cv2.boundingRect(best)
-    m = cv2.moments(best)
+    peri = cv2.arcLength(cnt, True)
+    if peri <= 1e-6:
+        return None
+
+    # Polygon approximation: a gate frame reduces to a quadrilateral.
+    approx = cv2.approxPolyDP(cnt, GATE_APPROX_EPS * peri, True)
+    n_vert = len(approx)
+    if not (GATE_MIN_VERTICES <= n_vert <= GATE_MAX_VERTICES):
+        return None
+
+    x, y, bw, bh = cv2.boundingRect(cnt)
+    if bh <= 0:
+        return None
+    aspect = bw / float(bh)
+    if not (GATE_ASPECT_MIN <= aspect <= GATE_ASPECT_MAX):
+        return None
+
+    hull_area = cv2.contourArea(cv2.convexHull(cnt))
+    solidity = area / hull_area if hull_area > 1e-6 else 0.0
+    if solidity < GATE_MIN_SOLIDITY:
+        return None
+
+    # Centre from the polygon itself (its area centroid), never the axis-aligned bbox.
+    m = cv2.moments(approx)
     if abs(m.get("m00", 0.0)) < 1e-6:
-        cx = x + 0.5 * bw
-        cy = y + 0.5 * bh
+        pts = approx.reshape(-1, 2).astype(np.float64)
+        cx = float(pts[:, 0].mean())
+        cy = float(pts[:, 1].mean())
     else:
         cx = float(m["m10"] / m["m00"])
         cy = float(m["m01"] / m["m00"])
 
-    ex = (cx - 0.5 * w) / max(0.5 * w, 1.0)
-    ey = (cy - 0.5 * h) / max(0.5 * h, 1.0)
+    ex = (cx - 0.5 * img_w) / max(0.5 * img_w, 1.0)
+    ey = (cy - 0.5 * img_h) / max(0.5 * img_h, 1.0)
 
     return {
         "found": True,
         "cx": cx,
         "cy": cy,
         "bbox": (x, y, bw, bh),
-        "area": best_area,
+        "area": area,
         "ex": ex,
         "ey": ey,
-    }, mask
+        "n_vert": int(n_vert),
+        "aspect": float(aspect),
+        "solidity": float(solidity),
+        "approx": approx,
+    }
 
 
-class GateStateMachine:
-    def __init__(self):
-        self.state = "SEARCH"
-        self.t_state = 0.0
-        self.gates = 0
-        self.height = 0.8
+def detect_green_gate(rgb_img, hsv_lo, hsv_hi, min_v, min_area_frac, kernel_size=3, *, use_bw=False):
+    """Detect gate(s) and return (detection_dict, mask).
 
-    def reset(self, height=0.8):
-        self.state = "SEARCH"
-        self.t_state = 0.0
-        self.gates = 0
-        self.height = float(height)
+    The detection dict describes the *selected* gate (the rightmost one when
+    several are visible) and carries the full candidate list under "candidates"
+    so callers can visualise rejected/extra detections.
 
-    def step(
-        self,
-        dt,
-        found,
-        ex,
-        ey,
-        *,
-        search_yawrate=-20.0,
-        k_yaw=80.0,
-        max_yawrate=70.0,
-        forward_speed=0.35,
-        push_duration_s=1.0,
-        center_tol_x=0.10,
-        center_tol_y=0.12,
-        k_height=1.2,
-        max_dh_per_s=0.6,
-        min_height=0.2,
-        max_height=2.0,
-    ):
-        self.t_state += float(dt)
+    Robustness vs. the old "largest blob" approach:
+      * each contour is approximated to a polygon and must look like a roughly
+        square quad frame (vertex count / aspect / solidity gates);
+      * multiple gates are kept, and the rightmost is chosen for the controller.
+    """
+    h, w = rgb_img.shape[:2]
+    mask = _build_mask(rgb_img, hsv_lo, hsv_hi, min_v, kernel_size, use_bw)
 
-        x_cmd = 0.0
-        y_cmd = 0.0
-        yaw_cmd = 0.0
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for cnt in contours:
+        cand = _gate_candidate(cnt, w, h, min_area_frac)
+        if cand is not None:
+            candidates.append(cand)
 
-        if self.state == "SEARCH":
-            yaw_cmd = float(search_yawrate)
-            if found:
-                self.state = "CENTER"
-                self.t_state = 0.0
+    if not candidates:
+        return {"found": False, "candidates": []}, mask
 
-        elif self.state == "CENTER":
-            if not found:
+    # Selection policy: take the most-right gate (largest centroid x).
+    best = max(candidates, key=lambda c: c["cx"])
+    best = dict(best)  # don't mutate the list entry
+    best["candidates"] = candidates
+    best["n_candidates"] = len(candidates)
+    return best, mask
+
+
+class GateController:
+    """Offline simulation of the lap1_test.py world-frame state machine.
+
+    Detection is fed in from the real video frame each step; the drone pose is
+    simulated by integrating the commanded position setpoints (no Kalman offline).
+
+    States: WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> (repeat) -> DONE
+      WAIT     immediately arms the sequence.
+      TAKEOFF  ramps the height setpoint up to search_height.
+      SEARCH   yaws in place until a gate is found, then locks it and builds a
+               fly-through trajectory.
+      CHASE    follows the trajectory, refines the locked gate (EMA), points yaw
+               at it, and commits to PUSH once the gate fills the frame; times
+               out back to SEARCH if the gate is lost.
+      PUSH     drives straight to an overshoot point for push_duration_s, then
+               counts the gate and returns to SEARCH (or DONE at max_gates).
+    """
+
+    def __init__(self, calib):
+        self.calib = calib
+        self.reset()
+
+    def reset(self):
+        self.state = "WAIT"
+        self.est = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+        self.pos = {"x": 0.0, "y": 0.0, "z": TAKEOFF_START_HEIGHT, "yaw": 0.0}
+        self.gate_world = None
+        self.traj = []
+        self.traj_idx = 0
+        self.gates_passed = 0
+        self.push_target = (0.0, 0.0, TAKEOFF_START_HEIGHT)
+        self.t = 0.0
+        self.state_t0 = 0.0
+
+    def _gate_to_world(self, ex, ey, bbox):
+        return gate_to_world(
+            ex, ey, bbox,
+            self.est["z"], self.est["yaw"], self.calib,
+            drone_x=self.est["x"], drone_y=self.est["y"],
+        )
+
+    def _build_traj(self, gate):
+        x0, y0, z0 = self.est["x"], self.est["y"], self.est["z"]
+        gx, gy, gz = gate
+        dx, dy = gx - x0, gy - y0
+        mag = np.hypot(dx, dy) + 1e-6
+        end_x = gx + TRAJ_OVERSHOOT * dx / mag
+        end_y = gy + TRAJ_OVERSHOOT * dy / mag
+        ts = np.linspace(0.0, 1.0, TRAJ_N_STEPS + 1)[1:]
+        return [(x0 + (end_x - x0) * t,
+                 y0 + (end_y - y0) * t,
+                 z0 + (gz - z0) * t) for t in ts]
+
+    def _integrate(self, dt):
+        """Simulated pose tracks the commanded setpoint (first-order, rate-limited)."""
+        if dt <= 0:
+            return
+        for k in ("x", "y", "z"):
+            err = self.pos[k] - self.est[k]
+            self.est[k] += float(np.clip(err, -SIM_MAX_SPEED * dt, SIM_MAX_SPEED * dt))
+        dyaw = (self.pos["yaw"] - self.est["yaw"] + 180.0) % 360.0 - 180.0
+        self.est["yaw"] += float(np.clip(dyaw, -SIM_MAX_YAWRATE * dt, SIM_MAX_YAWRATE * dt))
+
+    def step(self, dt, det, img_area, *,
+             search_yawrate=SEARCH_YAWRATE,
+             search_height=SEARCH_HEIGHT,
+             pass_area_frac=PASS_AREA_FRAC,
+             push_duration_s=PUSH_DURATION_S):
+        self.t += float(dt)
+        now = self.t
+
+        found = bool(det.get("found", False))
+        ex = float(det.get("ex", 0.0))
+        ey = float(det.get("ey", 0.0))
+        bbox = det.get("bbox", None)
+        area = float(det.get("area", 0.0))
+
+        if self.state == "WAIT":
+            self.state = "TAKEOFF"
+            self.state_t0 = now
+
+        if self.state == "TAKEOFF":
+            self.pos["z"] = float(min(self.pos["z"] + TAKEOFF_RATE * dt, search_height))
+            if self.pos["z"] >= search_height - 1e-3:
                 self.state = "SEARCH"
-                self.t_state = 0.0
+                self.state_t0 = now
+
+        elif self.state == "SEARCH":
+            self.pos["yaw"] += search_yawrate * dt
+            if found and bbox is not None:
+                gw = self._gate_to_world(ex, ey, bbox)
+                self.gate_world = gw
+                self.traj = self._build_traj(gw)
+                self.traj_idx = 0
+                self.state = "CHASE"
+                self.state_t0 = now
+
+        elif self.state == "CHASE":
+            if (now - self.state_t0) > CHASE_TIMEOUT:
+                self.gate_world = None
+                self.traj = []
+                self.traj_idx = 0
+                self.state = "SEARCH"
+                self.state_t0 = now
             else:
-                yaw_cmd = float(np.clip(-k_yaw * ex, -max_yawrate, max_yawrate))
-                y_cmd = float(np.clip(-0.15 * ex, -0.2, 0.2))
+                if found and bbox is not None:
+                    nx, ny, nz = self._gate_to_world(ex, ey, bbox)
+                    ox, oy, oz = self.gate_world
+                    self.gate_world = (
+                        ox + GATE_EMA_ALPHA * (nx - ox),
+                        oy + GATE_EMA_ALPHA * (ny - oy),
+                        oz + GATE_EMA_ALPHA * (nz - oz),
+                    )
+                    if self.traj_idx == 0:
+                        self.traj = self._build_traj(self.gate_world)
 
-                dh = float(np.clip(-k_height * ey, -max_dh_per_s, max_dh_per_s))
-                self.height = float(np.clip(self.height + dh * float(dt), min_height, max_height))
-
-                centered = (abs(ex) <= center_tol_x) and (abs(ey) <= center_tol_y)
-                if centered:
+                if img_area > 0 and area / img_area > pass_area_frac:
+                    yaw_r = np.deg2rad(self.est["yaw"])
+                    push_dist = FORWARD_SPEED * push_duration_s + TRAJ_OVERSHOOT
+                    self.push_target = (
+                        self.est["x"] + push_dist * np.cos(yaw_r),
+                        self.est["y"] + push_dist * np.sin(yaw_r),
+                        self.pos["z"],
+                    )
                     self.state = "PUSH"
-                    self.t_state = 0.0
+                    self.state_t0 = now
+                elif self.traj:
+                    wp = self.traj[self.traj_idx]
+                    self.pos["x"], self.pos["y"], self.pos["z"] = wp
+                    gx, gy, _ = self.gate_world
+                    self.pos["yaw"] = float(np.degrees(
+                        np.arctan2(gy - self.est["y"], gx - self.est["x"])))
+                    dist_wp = np.hypot(self.est["x"] - wp[0], self.est["y"] - wp[1])
+                    if dist_wp < WAYPOINT_TOL and self.traj_idx < len(self.traj) - 1:
+                        self.traj_idx += 1
 
         elif self.state == "PUSH":
-            x_cmd = float(forward_speed)
-            if self.t_state >= float(push_duration_s):
-                self.gates += 1
-                self.state = "SEARCH"
-                self.t_state = 0.0
+            self.pos["x"], self.pos["y"], self.pos["z"] = self.push_target
+            if (now - self.state_t0) >= push_duration_s:
+                self.gates_passed += 1
+                self.gate_world = None
+                self.traj = []
+                self.traj_idx = 0
+                if self.gates_passed >= MAX_GATES:
+                    self.state = "DONE"
+                else:
+                    self.state = "SEARCH"
+                    self.state_t0 = now
 
-        return x_cmd, y_cmd, yaw_cmd, self.height
+        self.pos["z"] = float(np.clip(self.pos["z"], MIN_HEIGHT, MAX_HEIGHT))
+        self._integrate(dt)
+        return self.state
 
 
 def main():
     parser = argparse.ArgumentParser(description="Green gate detector video harness")
     parser.add_argument("--video",      default=os.path.join("Video", "fpv_20260519_093807.mp4"))
     parser.add_argument("--calib",      default=None,  help="Path to calibration.json")
-    parser.add_argument("--drone-z",    type=float, default=0.8, help="Simulated drone Z in m")
-    parser.add_argument("--drone-yaw",  type=float, default=0.0, help="Simulated drone yaw in deg")
     args = parser.parse_args()
     calib = load_calibration(args.calib)
 
@@ -265,7 +443,7 @@ def main():
     # State
     idx = 0
     playing = False
-    fsm = GateStateMachine()
+    fsm = GateController(calib)
 
     # Initial parameters (match lap1 defaults)
     params = {
@@ -275,13 +453,10 @@ def main():
         "v_lo": 50,
         "min_v": 240,
         "min_area_frac": 0.01,
-        "kernel": 9,
-        "search_yawrate": -20.0,
-        "k_yaw": 80.0,
-        "k_height": 1.2,
-        "push_duration": 1.0,
-        "drone_z":   args.drone_z,
-        "drone_yaw": args.drone_yaw,
+        "kernel": 3,
+        "search_yawrate": SEARCH_YAWRATE,
+        "search_height": SEARCH_HEIGHT,
+        "pass_area_frac": PASS_AREA_FRAC,
     }
 
     frame0 = store.get(0)
@@ -320,9 +495,18 @@ def main():
         h, w = overlay.shape[:2]
         cv2.drawMarker(overlay, (w // 2, h // 2), (255, 255, 255), cv2.MARKER_CROSS, 14, 1)
 
-        if det.get("found", False) and det.get("bbox") is not None:
-            x, y, bw, bh = det["bbox"]
-            cv2.rectangle(overlay, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+        # Draw every accepted candidate thin/yellow; the selected (rightmost) thick/green.
+        sel_bbox = det.get("bbox")
+        for cand in det.get("candidates", []):
+            cx_b, cy_b, bw_b, bh_b = cand["bbox"]
+            is_sel = (cand["bbox"] == sel_bbox)
+            color = (0, 255, 0) if is_sel else (255, 255, 0)
+            thick = 2 if is_sel else 1
+            cv2.rectangle(overlay, (cx_b, cy_b), (cx_b + bw_b, cy_b + bh_b), color, thick)
+            if cand.get("approx") is not None:
+                cv2.polylines(overlay, [cand["approx"]], True, color, thick)
+
+        if det.get("found", False) and sel_bbox is not None:
             cv2.circle(overlay, (int(round(det["cx"])), int(round(det["cy"]))), 4, (255, 0, 0), -1)
 
         return overlay, mask, det
@@ -338,7 +522,7 @@ def main():
     title = fig.suptitle("", fontsize=12)
 
     def refresh():
-        nonlocal idx
+        nonlocal idx, playing
         frame = store.get(idx)
         overlay, mask, det = compute_panels(frame)
 
@@ -346,38 +530,46 @@ def main():
         ex = float(det.get("ex", 0.0))
         ey = float(det.get("ey", 0.0))
 
-        # Simulate controller step even when paused (dt=0) so state doesn't advance.
+        # Advance the state machine only while playing (dt=0 when paused/scrubbing).
         dt = (1.0 / fps) if playing else 0.0
-        x_cmd, y_cmd, yaw_cmd, h_cmd = fsm.step(
+        prev_state = fsm.state
+        state = fsm.step(
             dt,
-            found,
-            ex,
-            ey,
+            det,
+            float(TARGET_W * TARGET_H),
             search_yawrate=params["search_yawrate"],
-            k_yaw=params["k_yaw"],
-            k_height=params["k_height"],
-            push_duration_s=params["push_duration"],
+            search_height=params["search_height"],
+            pass_area_frac=params["pass_area_frac"],
         )
+        if playing and state != prev_state:
+            print(f"[frame {idx + 1:04d}] {prev_state} -> {state}  gates={fsm.gates_passed}")
+        if state == "DONE" and playing:
+            playing = False
+            b_play.label.set_text("Play")
 
-        # World-frame gate estimate
-        world_str = "n/a"
-        if found and det.get("bbox") is not None:
-            gx, gy, gz = gate_to_world(
-                ex, ey, det["bbox"],
-                params["drone_z"], params["drone_yaw"], calib,
-            )
+        # Locked world-frame gate estimate (maintained by the controller).
+        if fsm.gate_world is not None:
+            gx, gy, gz = fsm.gate_world
             world_str = f"({gx:+.2f}, {gy:+.2f}, {gz:+.2f}) m"
-            if playing:
-                print(f"[frame {idx + 1:04d}] gate_world = {world_str}")
+        else:
+            world_str = "n/a"
 
         im0.set_data(overlay)
         im1.set_data(mask)
 
+        n_cand = int(det.get("n_candidates", 0))
+        shape_str = ""
+        if found:
+            shape_str = f" verts={det.get('n_vert', 0)} ar={det.get('aspect', 0):.2f} sol={det.get('solidity', 0):.2f}"
+        est = fsm.est
+        pos = fsm.pos
         title.set_text(
-            f"Frame {idx + 1}/{store.frame_count}  proc_fps={fps:.1f} src_fps={src_fps:.1f} step={step_frames}  found={int(found)}  "
-            f"ex={ex:+.2f} ey={ey:+.2f}  state={fsm.state} gates={fsm.gates}  "
-            f"cmd: x={x_cmd:+.2f} y={y_cmd:+.2f} yaw={yaw_cmd:+.1f} h={h_cmd:.2f}\n"
-            f"gate_world={world_str}   drone: z={params['drone_z']:.2f} m  yaw={params['drone_yaw']:.0f}°"
+            f"Frame {idx + 1}/{store.frame_count}  proc_fps={fps:.1f} src_fps={src_fps:.1f} step={step_frames}  "
+            f"found={int(found)} cand={n_cand}{shape_str}  ex={ex:+.2f} ey={ey:+.2f}\n"
+            f"state={fsm.state}  gates={fsm.gates_passed}/{MAX_GATES}  traj={fsm.traj_idx}/{len(fsm.traj)}  "
+            f"gate_world={world_str}\n"
+            f"est: x={est['x']:+.2f} y={est['y']:+.2f} z={est['z']:.2f} yaw={est['yaw']:+.0f}°   "
+            f"cmd: x={pos['x']:+.2f} y={pos['y']:+.2f} z={pos['z']:.2f} yaw={pos['yaw']:+.0f}°"
         )
         fig.canvas.draw_idle()
 
@@ -403,13 +595,13 @@ def main():
     ax_kern = plt.axes([0.12, 0.07, 0.35, 0.03])
     s_kern = Slider(ax_kern, "kernel", 1, 21, valinit=params["kernel"], valfmt="%d", valstep=2)
 
-    ax_kyaw = plt.axes([0.55, 0.07, 0.35, 0.03])
-    s_kyaw = Slider(ax_kyaw, "K yaw", 0.0, 150.0, valinit=params["k_yaw"], valfmt="%.1f")
+    ax_pass = plt.axes([0.55, 0.07, 0.35, 0.03])
+    s_pass = Slider(ax_pass, "pass area%", 0.05, 0.60, valinit=params["pass_area_frac"], valfmt="%.2f")
 
-    ax_dz   = plt.axes([0.12, 0.27, 0.35, 0.03])
-    s_dz    = Slider(ax_dz,   "Drone Z (m)",   0.0,  2.5, valinit=params["drone_z"],   valfmt="%.2f")
-    ax_dyaw = plt.axes([0.55, 0.27, 0.35, 0.03])
-    s_dyaw  = Slider(ax_dyaw, "Drone Yaw (°)", -180, 180, valinit=params["drone_yaw"], valfmt="%.0f")
+    ax_sh   = plt.axes([0.12, 0.27, 0.35, 0.03])
+    s_sh    = Slider(ax_sh,   "Search H (m)",  0.2,  2.5, valinit=params["search_height"], valfmt="%.2f")
+    ax_syaw = plt.axes([0.55, 0.27, 0.35, 0.03])
+    s_syaw  = Slider(ax_syaw, "Search yaw/s",  -60,   60, valinit=params["search_yawrate"], valfmt="%.0f")
 
     def on_slider(_):
         params["h_lo"] = int(s_hlo.val)
@@ -419,12 +611,12 @@ def main():
         params["min_v"] = int(s_minv.val)
         params["min_area_frac"] = float(s_area.val)
         params["kernel"] = int(s_kern.val)
-        params["k_yaw"] = float(s_kyaw.val)
-        params["drone_z"]   = float(s_dz.val)
-        params["drone_yaw"] = float(s_dyaw.val)
+        params["pass_area_frac"] = float(s_pass.val)
+        params["search_height"]  = float(s_sh.val)
+        params["search_yawrate"] = float(s_syaw.val)
         refresh()
 
-    for s in (s_hlo, s_hhi, s_slo, s_vlo, s_minv, s_area, s_kern, s_kyaw, s_dz, s_dyaw):
+    for s in (s_hlo, s_hhi, s_slo, s_vlo, s_minv, s_area, s_kern, s_pass, s_sh, s_syaw):
         s.on_changed(on_slider)
 
     # --- Buttons ---
@@ -455,7 +647,7 @@ def main():
         refresh()
 
     def on_reset(_):
-        fsm.reset(height=0.8)
+        fsm.reset()
         refresh()
 
     b_prev.on_clicked(on_prev)
