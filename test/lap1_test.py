@@ -436,7 +436,7 @@ class FPVWindow(QtWidgets.QWidget):
 
         self._timer = QtCore.QTimer()
         self._timer.timeout.connect(self._send_setpoint)
-        self._timer.setInterval(100)
+        self._timer.setInterval(20)
         self._timer.start()
 
     def _update_image(self, img):
