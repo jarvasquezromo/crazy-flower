@@ -435,7 +435,7 @@ class FPVWindow(QtWidgets.QWidget):
         self.cf.supervisor.send_arming_request(True)
 
         self._timer = QtCore.QTimer()
-        #self._timer.timeout.connect(self._send_setpoint)
+        self._timer.timeout.connect(self._send_setpoint)
         self._timer.setInterval(100)
         self._timer.start()
 
@@ -631,11 +631,16 @@ class FPVWindow(QtWidgets.QWidget):
         lc.add_variable('stateEstimate.y', 'float')
         lc.add_variable('stateEstimate.z', 'float')
         lc.add_variable('stabilizer.yaw', 'float')
-        self.cf.log.add_config(lc)
+        try:
+            self.cf.log.add_config(lc)
+        except Exception as e:
+            print(f'Could not add StateEst log config: {e}')
+            return
         lc.data_received_cb.add_callback(self._on_log)
         lc.error_cb.add_callback(lambda _conf, msg: print('Log error:', msg))
         lc.start()
         self._log_cfg = lc
+        print('StateEst log started — waiting for first Lighthouse position…')
 
     def _on_log(self, _ts, data, _lc):
         with self._pos_lock:
@@ -652,6 +657,11 @@ class FPVWindow(QtWidgets.QWidget):
                 self._pos['z']   = self._est['z']
                 self._pos['yaw'] = self._est['yaw']
                 self._log_ready  = True
+                print(
+                    f"First Lighthouse position: x={self._est['x']:.2f} "
+                    f"y={self._est['y']:.2f} z={self._est['z']:.2f} "
+                    f"yaw={self._est['yaw']:.1f} — leaving WAIT"
+                )
 
     def _gate_to_world(self, ex, ey, bbox):
         """Project image-plane gate centre + bbox width to a world-frame point."""
