@@ -1,4 +1,59 @@
 #!/usr/bin/env python3
+"""Autonomous gate-flying lap for the Crazyflie + AI-deck.
+
+The drone streams JPEG frames from the AI-deck over Wi-Fi/UDP, detects green
+race gates in each frame, and flies through them one after another using the
+Lighthouse/Kalman world-frame estimate for positioning.
+
+Pipeline
+--------
+1. Video link (`UdpVideoThread`)
+   Connects to the AI-deck (192.168.4.1:5000), reassembles the CPX/JPEG image
+   stream, decodes each frame to RGB, and emits it to the Qt GUI. The first
+   frame's size selects/scales the camera calibration (`calibration.json`).
+
+2. Gate detection (`_detect_green_gate`, `_gate_candidate`)
+   - Threshold the (undistorted) image into a binary mask of bright pixels and
+     morphologically close it.
+   - For every contour, validate it as a *gate-shaped polygon*: approximate it
+     with `approxPolyDP` and require a near-quad vertex count, a roughly square
+     aspect ratio, and high solidity (near-convex outline). This rejects blobs
+     that are bright but not gate-like.
+   - The gate centre is the polygon's own area centroid (not the bounding box).
+   - All passing candidates are kept; the controller uses the *rightmost* gate
+     (largest centroid x) so the lap is taken consistently around the course.
+   - The image-plane error (ex, ey) and bbox width feed `_gate_to_world`, a
+     pinhole projection that turns the detection into a world-frame point using
+     the current yaw/position estimate and the known physical gate width.
+
+3. State machine (`_send_setpoint`, runs at 10 Hz)
+   WAIT     -> wait for the Kalman filter to converge, then arm the sequence.
+   TAKEOFF  -> ramp the height setpoint up to SEARCH_HEIGHT.
+   SEARCH   -> yaw slowly in place until a gate is detected; on detection, lock
+               its world position, build a straight fly-through trajectory
+               (with overshoot) and switch to CHASE.
+   CHASE    -> follow the trajectory waypoints while continuously refining the
+               locked gate position (EMA) and pointing yaw at the gate. Times
+               out back to SEARCH if the gate is lost for CHASE_TIMEOUT seconds.
+               When the gate fills the frame (area fraction > PASS_AREA_FRAC),
+               commit to a push.
+   PUSH     -> drive straight through the gate to an overshoot point for
+               PUSH_DURATION_S, then count the gate and return to SEARCH
+               (or DONE once MAX_GATES gates have been passed).
+   DONE     -> stop setpoints and halt.
+
+   STOP     -> safety brake: continuously command zero velocity (hover, no
+               motion). Entered with the Escape key.
+
+   Setpoints are sent as world-frame position+yaw commands. Arrow keys / WASD
+   allow manual nudging, Escape engages the zero-velocity safety brake, and
+   Space aborts hard (cut motors + DONE).
+
+Usage
+-----
+  python3 crazy-flower/test/lap1_test.py
+Set the radio URI via the CRAZYFLIE_URI env var (default radio://0/70/2M/...).
+"""
 import contextlib
 import json
 import logging
@@ -133,7 +188,15 @@ MAX_HEIGHT = 2.0             # meters (safety clamp)
 K_HEIGHT = 1.2               # (m/s) per normalized vertical error
 MAX_DH_PER_S = 0.6           # max height change rate
 
-MORPH_KERNEL = np.ones((9, 9), np.uint8)
+MORPH_KERNEL = np.ones((3, 3), np.uint8)
+
+# --- Gate-shape acceptance thresholds (a gate is a roughly-square quad frame) ---
+GATE_MIN_VERTICES = 4      # quad after polygon approximation
+GATE_MAX_VERTICES = 8      # allow a few extra vertices from noise / rounded corners
+GATE_ASPECT_MIN   = 0.45   # bbox w/h: tolerate perspective foreshortening
+GATE_ASPECT_MAX   = 2.2
+GATE_MIN_SOLIDITY = 0.80   # area / convex-hull area: frame outline is near-convex
+GATE_APPROX_EPS   = 0.04   # approxPolyDP epsilon, fraction of perimeter
 
 # --- Camera / world-frame projection ---
 GATE_PHYS_W    = 0.8                 # metres, physical gate width for distance estimate
@@ -158,18 +221,73 @@ def _muted_stderr():
         os.close(saved)
 
 
+def _gate_candidate(cnt, img_w, img_h):
+    """Validate a contour as a gate-shaped polygon.
+
+    Returns a candidate dict if the contour passes the polygon/shape tests,
+    else None. The centre is the polygon's own area centroid — never the
+    axis-aligned bounding box.
+    """
+    area = float(cv2.contourArea(cnt))
+    if area < (MIN_GREEN_AREA_FRAC * float(img_w * img_h)):
+        return None
+
+    peri = cv2.arcLength(cnt, True)
+    if peri <= 1e-6:
+        return None
+
+    # Polygon approximation: a gate frame reduces to a quadrilateral.
+    approx = cv2.approxPolyDP(cnt, GATE_APPROX_EPS * peri, True)
+    n_vert = len(approx)
+    if not (GATE_MIN_VERTICES <= n_vert <= GATE_MAX_VERTICES):
+        return None
+
+    x, y, bw, bh = cv2.boundingRect(cnt)
+    if bh <= 0:
+        return None
+    aspect = bw / float(bh)
+    if not (GATE_ASPECT_MIN <= aspect <= GATE_ASPECT_MAX):
+        return None
+
+    hull_area = cv2.contourArea(cv2.convexHull(cnt))
+    solidity = area / hull_area if hull_area > 1e-6 else 0.0
+    if solidity < GATE_MIN_SOLIDITY:
+        return None
+
+    # Centre from the polygon itself (area centroid), with a vertex-mean fallback.
+    m = cv2.moments(approx)
+    if abs(m.get("m00", 0.0)) < 1e-6:
+        pts = approx.reshape(-1, 2).astype(np.float64)
+        cx = float(pts[:, 0].mean())
+        cy = float(pts[:, 1].mean())
+    else:
+        cx = float(m["m10"] / m["m00"])
+        cy = float(m["m01"] / m["m00"])
+
+    ex = (cx - CAMERA_CX) / max(0.5 * img_w, 1.0)
+    ey = (cy - CAMERA_CY) / max(0.5 * img_h, 1.0)
+
+    return {
+        "found": True,
+        "cx": cx,
+        "cy": cy,
+        "area": area,
+        "bbox": (x, y, bw, bh),
+        "ex": ex,
+        "ey": ey,
+        "approx": approx,
+    }
+
+
 def _detect_green_gate(rgb_img):
-    """Return detection dict {found, cx, cy, area, bbox, ex, ey} from an RGB image."""
+    """Detect gate(s) and return a detection dict.
+
+    1. Threshold bright pixels into a binary mask, morphologically close it.
+    2. Find contours and validate each as a gate-shaped polygon (vertex count,
+       aspect ratio, solidity). The centre is the polygon centroid, not the bbox.
+    3. Keep every passing candidate; select the *rightmost* one (largest cx) for
+       the controller. Rejected/extra candidates are returned under "candidates".
     """
-    It works this way : 
-    1. Convert the RGB image to grayscale.
-    2. Create a binary mask where bright pixels are white and the rest are black.
-    3. Apply morphological close to clean up the mask.
-    4. Find contours in the mask and select the largest one as the detected gate.
-    5. Calculate the center of the detected gate and the error from the image center.
-    6. Return a dictionary with the detection results.
-    """
-    
     h, w = rgb_img.shape[:2]
     gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
     threshold = max(int(GREEN_HSV_LO[2]), int(GREEN_MIN_V) if GREEN_MIN_V is not None else 0)
@@ -177,43 +295,21 @@ def _detect_green_gate(rgb_img):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=3)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return {"found": False, "mask": mask}
-
-    img_area = float(h * w)
-    best = None
-    best_area = 0.0
+    candidates = []
     for cnt in contours:
-        a = float(cv2.contourArea(cnt))
-        if a > best_area:
-            best_area = a
-            best = cnt
+        cand = _gate_candidate(cnt, w, h)
+        if cand is not None:
+            candidates.append(cand)
 
-    if best is None or best_area < (MIN_GREEN_AREA_FRAC * img_area):
-        return {"found": False, "mask": mask}
+    if not candidates:
+        return {"found": False, "mask": mask, "candidates": []}
 
-    x, y, bw, bh = cv2.boundingRect(best)
-    m = cv2.moments(best)
-    if abs(m.get("m00", 0.0)) < 1e-6:
-        cx = x + 0.5 * bw
-        cy = y + 0.5 * bh
-    else:
-        cx = float(m["m10"] / m["m00"])
-        cy = float(m["m01"] / m["m00"])
-
-    ex = (cx - CAMERA_CX) / max(0.5 * w, 1.0)
-    ey = (cy - CAMERA_CY) / max(0.5 * h, 1.0)
-
-    return {
-        "found": True,
-        "cx": cx,
-        "cy": cy,
-        "area": best_area,
-        "bbox": (x, y, bw, bh),
-        "ex": ex,
-        "ey": ey,
-        "mask": mask,
-    }
+    # Selection policy: take the most-right gate (largest centroid x).
+    best = dict(max(candidates, key=lambda c: c["cx"]))
+    best["mask"] = mask
+    best["candidates"] = candidates
+    best["n_candidates"] = len(candidates)
+    return best
 
 
 class UdpVideoThread(QtCore.QThread):
@@ -312,7 +408,8 @@ class FPVWindow(QtWidgets.QWidget):
         self._traj_idx   = 0
 
         # Simple autonomy state machine.
-        self._gate_state = "WAIT"  # WAIT -> TAKEOFF -> SEARCH -> CHASE -> (repeat)
+        self._gate_state = "WAIT"  # WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> SEARCH ...
+        self._push_target = (0.0, 0.0, TAKEOFF_START_HEIGHT)  # world point for PUSH state
         self._log_ready  = False
         self._state_t0 = time.monotonic()
         self._gates_passed = 0
@@ -359,11 +456,18 @@ class FPVWindow(QtWidgets.QWidget):
                 "area": float(det.get("area", 0.0)),
             }
 
-        # Debug overlay on the RGB image.
+        # Debug overlay on the RGB image: candidates thin/yellow, selected thick/green.
         disp = color.copy()
-        if det.get("found", False) and det.get("bbox") is not None:
-            x, y, bw, bh = det["bbox"]
-            cv2.rectangle(disp, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+        sel_bbox = det.get("bbox")
+        for cand in det.get("candidates", []):
+            is_sel = (cand["bbox"] == sel_bbox)
+            ccolor = (0, 255, 0) if is_sel else (255, 255, 0)
+            cthick = 2 if is_sel else 1
+            cx_b, cy_b, bw_b, bh_b = cand["bbox"]
+            cv2.rectangle(disp, (cx_b, cy_b), (cx_b + bw_b, cy_b + bh_b), ccolor, cthick)
+            if cand.get("approx") is not None:
+                cv2.polylines(disp, [cand["approx"]], True, ccolor, cthick)
+        if det.get("found", False) and sel_bbox is not None:
             cx, cy = int(round(det["cx"])), int(round(det["cy"]))
             cv2.circle(disp, (cx, cy), 4, (255, 0, 0), -1)
 
@@ -388,6 +492,12 @@ class FPVWindow(QtWidgets.QWidget):
         now = time.monotonic()
         dt = float(np.clip(now - self._last_ctrl_time, 0.02, 0.3))
         self._last_ctrl_time = now
+
+        if self._gate_state == "STOP":
+            # Safety brake: command zero velocity (hold in place, no motion).
+            # Keep streaming so the firmware command watchdog stays satisfied.
+            self.cf.commander.send_velocity_world_setpoint(0.0, 0.0, 0.0, 0.0)
+            return
 
         with self._vision_lock:
             found = bool(self._vision.get("found", False))
@@ -450,18 +560,17 @@ class FPVWindow(QtWidgets.QWidget):
                     if self._traj_idx == 0:
                         self._traj = self._build_traj(self._gate_world)
 
-                # Gate passed: bbox fills a large fraction of the frame.
+                # Gate close enough (bbox fills a large fraction of the frame):
+                # commit to a straight push through it before searching again.
                 if area / img_area > PASS_AREA_FRAC:
-                    self._gates_passed += 1
-                    self._gate_world = None
-                    self._traj       = []
-                    self._traj_idx   = 0
-                    if self._gates_passed >= MAX_GATES:
-                        self._gate_state = "DONE"
-                        self.cf.commander.send_stop_setpoint()
-                        self._timer.stop()
-                        return
-                    self._gate_state = "SEARCH"
+                    yaw_r = np.deg2rad(est['yaw'])
+                    push_dist = FORWARD_SPEED * PUSH_DURATION_S + TRAJ_OVERSHOOT
+                    self._push_target = (
+                        est['x'] + push_dist * np.cos(yaw_r),
+                        est['y'] + push_dist * np.sin(yaw_r),
+                        self._pos['z'],
+                    )
+                    self._gate_state = "PUSH"
                     self._state_t0   = now
                 elif self._traj:
                     # Command next waypoint; aim yaw toward locked gate.
@@ -473,6 +582,22 @@ class FPVWindow(QtWidgets.QWidget):
                     dist_wp = np.hypot(est['x'] - wp[0], est['y'] - wp[1])
                     if dist_wp < WAYPOINT_TOL and self._traj_idx < len(self._traj) - 1:
                         self._traj_idx += 1
+
+        elif self._gate_state == "PUSH":
+            # Drive straight to the overshoot point (yaw held), then reset to SEARCH.
+            self._pos['x'], self._pos['y'], self._pos['z'] = self._push_target
+            if (now - self._state_t0) >= PUSH_DURATION_S:
+                self._gates_passed += 1
+                self._gate_world = None
+                self._traj       = []
+                self._traj_idx   = 0
+                if self._gates_passed >= MAX_GATES:
+                    self._gate_state = "DONE"
+                    self.cf.commander.send_stop_setpoint()
+                    self._timer.stop()
+                    return
+                self._gate_state = "SEARCH"
+                self._state_t0   = now
 
         self._pos['z'] = float(np.clip(self._pos['z'], MIN_HEIGHT, MAX_HEIGHT))
         self.cf.commander.send_position_setpoint(
@@ -490,6 +615,10 @@ class FPVWindow(QtWidgets.QWidget):
         if k == QtCore.Qt.Key.Key_S:     self._pos['z'] -= 0.1
         if k == QtCore.Qt.Key.Key_A:     self._pos['yaw'] -= 15.0
         if k == QtCore.Qt.Key.Key_D:     self._pos['yaw'] += 15.0
+        if k == QtCore.Qt.Key.Key_Escape:
+            # Safety: abort autonomy and brake to zero velocity (keep hovering).
+            self._gate_state = "STOP"
+            self._set_status('STOP — zero-velocity safety brake (Space to cut motors)')
         if k == QtCore.Qt.Key.Key_Space:
             self._gate_state = "DONE"
             self.cf.commander.send_stop_setpoint()
