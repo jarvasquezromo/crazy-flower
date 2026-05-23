@@ -29,9 +29,11 @@ class Visualisation:
         self._target_vel = None
         self._lock = threading.Lock()
         self._sampled = None
+        self._waypoints = None
         self._fig = None
         self._ax = None
         self._traj_line = None
+        self._waypoints_scatter = None
         self._path_line = None
         self._drone_scatter = None
         self._est_path_line = None
@@ -44,6 +46,35 @@ class Visualisation:
         """Attach a Trajectory instance and pre-sample it for plotting."""
         self.trajectory = trajectory
         self._sampled = self._sample_trajectory()
+
+    def set_waypoints(self, waypoints):
+        if waypoints is None:
+            self._waypoints = None
+            return
+        arr = np.array(waypoints, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] < 3:
+            return
+        self._waypoints = arr[:, :3]
+        if self._fig is not None and self._ax is not None:
+            self._plot_waypoints()
+
+    def _plot_waypoints(self):
+        if self._waypoints is None or self._waypoints.size == 0:
+            return
+        xs, ys, zs = self._waypoints[:, 0], self._waypoints[:, 1], self._waypoints[:, 2]
+        if self._waypoints_scatter is None:
+            self._waypoints_scatter = self._ax.scatter(
+                xs,
+                ys,
+                zs,
+                color='tab:green',
+                s=12,
+                alpha=0.8,
+                label='waypoints',
+            )
+            self._ax.legend()
+        else:
+            self._waypoints_scatter._offsets3d = (xs, ys, zs)
 
     def _sample_trajectory(self):
         if not self.trajectory or not getattr(self.trajectory, 'segment_times', None):
@@ -117,6 +148,8 @@ class Visualisation:
             self._ax.set_ylim(np.min(ys) - 0.5, np.max(ys) + 0.5)
             self._ax.set_zlim(max(0, np.min(zs) - 0.5), np.max(zs) + 0.5)
 
+        self._plot_waypoints()
+
         with self._lock:
             px, py, pz = self._pos.tolist()
         self._drone_scatter = self._ax.scatter([px], [py], [pz], color='red', s=60)
@@ -169,6 +202,7 @@ class Visualisation:
         self._fig = None
         self._ax = None
         self._traj_line = None
+        self._waypoints_scatter = None
         self._path_line = None
         self._drone_scatter = None
         self._est_path_line = None

@@ -34,7 +34,7 @@ class Trajectory:
         
         T = t_base + t_accel
         
-        return max(T, 1.0)
+        return max(T, 0.2)
     
 
     def solve_trajectory(self, waypoints):

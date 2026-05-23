@@ -31,18 +31,24 @@ logging.basicConfig(level=logging.ERROR)
 URI = uri_helper.uri_from_env(default='radio://0/70/2M/E7E7E7E705')
 
 
-HOME_POINT = [-2.0, 0.0, 1.5]
-LAND_POINT = [-2.0, 0.0, 0.0]
+HOME_POINT = [-0.0, 0.0, 1.5]
+LAND_POINT = [-0.0, 0.0, 0.0]
 
-GATE_PREPOST_DISTANCE = 0.2
+GATE_PREPOST_DISTANCE = 0.3
 
 GATES = [
     HOME_POINT,  
-    [0.68, -0.79, 1.28, -19],
-    [1.74, -0.89, 1.15, -1],
-    [2.22, 0.08, 1.43, 102],
-    [1.64, 0.82, 1.18, 165],
-    [0.64, 0.93, 1.26, -165],
+  [0.68, -0.79, 1.28, -19],
+  [1.74, -0.89, 1.15, -1],
+  [2.22, 0.08, 1.43, 102],
+  [1.64, 0.82, 1.18, 165],
+  [0.64, 0.93, 1.26, -165],
+    HOME_POINT,
+  [0.68, -0.79, 1.28, -19],
+  [1.74, -0.89, 1.15, -1],
+  [2.22, 0.08, 1.43, 102],
+  [1.64, 0.82, 1.18, 165],
+  [0.64, 0.93, 1.26, -165],
     HOME_POINT,
 ]
 
@@ -92,6 +98,7 @@ class Launcher:
         try:
             self.vis = Visualisation()
             self.vis.set_trajectory(self.follower.trajectory)
+            self.vis.set_waypoints(self.waypoints)
             self.vis.start()
         except Exception as e:
             print('Visualization unavailable:', e)
