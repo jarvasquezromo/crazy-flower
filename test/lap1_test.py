@@ -221,6 +221,42 @@ def _muted_stderr():
         os.close(saved)
 
 
+def _order_corners(pts):
+    """Order 4 image points as [TL, TR, BR, BL] (image y increases downward).
+
+    TL/BR are the corners with the smallest/largest x+y; TR/BL the largest/
+    smallest x-y. This fixes a consistent correspondence with the gate's
+    physical object points so solvePnP returns a stable pose.
+    """
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    s = pts[:, 0] + pts[:, 1]
+    d = pts[:, 0] - pts[:, 1]
+    ordered = np.array([
+        pts[np.argmin(s)],   # TL
+        pts[np.argmax(d)],   # TR
+        pts[np.argmax(s)],   # BR
+        pts[np.argmin(d)],   # BL
+    ], dtype=np.float64)
+    return ordered
+
+
+def _quad_corners(cnt, approx):
+    """Best 4-corner estimate of a gate quad, ordered TL/TR/BR/BL.
+
+    Uses the polygon approximation directly when it is a clean quad (keeps the
+    true perspective of the four corners); otherwise falls back to the rotated
+    min-area rectangle. Returns None if the 4 corners are not distinct.
+    """
+    if len(approx) == 4:
+        pts = approx.reshape(-1, 2).astype(np.float64)
+    else:
+        pts = cv2.boxPoints(cv2.minAreaRect(cnt)).astype(np.float64)
+    ordered = _order_corners(pts)
+    if len(np.unique(np.round(ordered, 1), axis=0)) != 4:
+        return None
+    return ordered
+
+
 def _gate_candidate(cnt, img_w, img_h):
     """Validate a contour as a gate-shaped polygon.
 
@@ -276,6 +312,7 @@ def _gate_candidate(cnt, img_w, img_h):
         "ex": ex,
         "ey": ey,
         "approx": approx,
+        "corners": _quad_corners(cnt, approx),  # ordered TL/TR/BR/BL for solvePnP
     }
 
 
@@ -454,6 +491,7 @@ class FPVWindow(QtWidgets.QWidget):
                 "ey": float(det.get("ey", 0.0)),
                 "bbox": det.get("bbox", None),
                 "area": float(det.get("area", 0.0)),
+                "corners": det.get("corners", None),
             }
 
         # Debug overlay on the RGB image: candidates thin/yellow, selected thick/green.
@@ -500,11 +538,12 @@ class FPVWindow(QtWidgets.QWidget):
             return
 
         with self._vision_lock:
-            found = bool(self._vision.get("found", False))
-            ex    = float(self._vision.get("ex", 0.0))
-            ey    = float(self._vision.get("ey", 0.0))
-            bbox  = self._vision.get("bbox", None)
-            area  = float(self._vision.get("area", 0.0))
+            found   = bool(self._vision.get("found", False))
+            ex      = float(self._vision.get("ex", 0.0))
+            ey      = float(self._vision.get("ey", 0.0))
+            bbox    = self._vision.get("bbox", None)
+            area    = float(self._vision.get("area", 0.0))
+            corners = self._vision.get("corners", None)
         with self._pos_lock:
             est = dict(self._est)
 
@@ -532,7 +571,7 @@ class FPVWindow(QtWidgets.QWidget):
             # Yaw in place; x/y/z hold their current commanded values.
             self._pos['yaw'] += SEARCH_YAWRATE * dt
             if found and bbox is not None:
-                gw = self._gate_to_world(ex, ey, bbox)
+                gw = self._gate_to_world(ex, ey, bbox, corners)
                 self._gate_world = gw
                 self._traj     = self._build_traj(gw)
                 self._traj_idx = 0
@@ -550,7 +589,7 @@ class FPVWindow(QtWidgets.QWidget):
             else:
                 # Continuously refine gate world position while visible.
                 if found and bbox is not None:
-                    new_gw = self._gate_to_world(ex, ey, bbox)
+                    new_gw = self._gate_to_world(ex, ey, bbox, corners)
                     ox, oy, oz = self._gate_world
                     nx, ny, nz = new_gw
                     self._gate_world = (
@@ -663,17 +702,69 @@ class FPVWindow(QtWidgets.QWidget):
                     f"yaw={self._est['yaw']:.1f} — leaving WAIT"
                 )
 
-    def _gate_to_world(self, ex, ey, bbox):
-        """Project image-plane gate centre + bbox width to a world-frame point."""
-        bw = bbox[2]
-        # Pinhole distance estimate: dist = (physical_width * focal_px) / bbox_px
-        dist = max((GATE_PHYS_W * CAMERA_FX) / max(bw, 1), 0.3)
-        x_err_px = ex * max(0.5 * IMG_WIDTH, 1.0)
-        y_err_px = ey * max(0.5 * IMG_HEIGHT, 1.0)
-        # Body-frame offsets (camera looks along +body_x)
-        dx_b =  dist
-        dy_b = -x_err_px * dist / CAMERA_FX
-        dz_b = -y_err_px * dist / CAMERA_FY
+    @staticmethod
+    def _gate_camera_pose(corners):
+        """Gate-centre position in the CAMERA frame via solvePnP, or None.
+
+        Uses the four detected gate corners and the known physical gate size,
+        with the calibrated intrinsics. The image is already undistorted, so
+        zero distortion is passed here (distortion must not be applied twice).
+        Returns (Xc, Yc, Zc) in the OpenCV camera frame: x right, y down,
+        z forward along the optical axis.
+        """
+        if corners is None:
+            return None
+        img_pts = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+        if img_pts.shape[0] != 4:
+            return None
+        # Physical gate corners (planar, z=0) in the order SOLVEPNP_IPPE_SQUARE
+        # expects: TL/TR/BR/BL with object y pointing up. This matches the
+        # TL/TR/BR/BL image-corner order from _order_corners.
+        h = 0.5 * GATE_PHYS_W
+        obj = np.array([
+            [-h,  h, 0.0],   # TL
+            [ h,  h, 0.0],   # TR
+            [ h, -h, 0.0],   # BR
+            [-h, -h, 0.0],   # BL
+        ], dtype=np.float64)
+        try:
+            ok, _rvec, tvec = cv2.solvePnP(
+                obj, img_pts, _camera_matrix(), None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        except cv2.error:
+            return None
+        if not ok:
+            return None
+        t = tvec.reshape(3)
+        if not np.all(np.isfinite(t)) or t[2] <= 0.0:
+            return None
+        return float(t[0]), float(t[1]), float(t[2])
+
+    def _gate_to_world(self, ex, ey, bbox, corners=None):
+        """Project a gate detection to a world-frame point.
+
+        Preferred path: solvePnP on the four gate corners + known gate size
+        (uses the full calibration, handles perspective/tilt). Falls back to the
+        coarse bbox-width pinhole range estimate when the corners are missing or
+        the PnP solve is degenerate.
+        """
+        cam = self._gate_camera_pose(corners)
+        if cam is not None:
+            # Camera frame (x right, y down, z forward) -> body frame
+            # (x forward, y left, z up): the camera looks along +body_x.
+            xc, yc, zc = cam
+            dx_b =  zc
+            dy_b = -xc
+            dz_b = -yc
+        else:
+            # Fallback: pinhole distance from bbox width (assumes fronto-parallel).
+            bw = bbox[2]
+            dist = max((GATE_PHYS_W * CAMERA_FX) / max(bw, 1), 0.3)
+            x_err_px = ex * max(0.5 * IMG_WIDTH, 1.0)
+            y_err_px = ey * max(0.5 * IMG_HEIGHT, 1.0)
+            dx_b =  dist
+            dy_b = -x_err_px * dist / CAMERA_FX
+            dz_b = -y_err_px * dist / CAMERA_FY
+
         with self._pos_lock:
             yaw_r = np.deg2rad(self._est['yaw'])
             ox, oy, oz = self._est['x'], self._est['y'], self._est['z']
