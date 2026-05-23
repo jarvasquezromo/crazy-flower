@@ -94,9 +94,9 @@ class FPVWindow(QtWidgets.QWidget):
 
     def _update_image(self, img):
         bayer = img.reshape((CAM_HEIGHT, CAM_WIDTH))
-        color = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2RGB)
-        h, w, ch = color.shape
-        q = QtGui.QImage(color.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888)
+        image = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2RGB)
+        h, w, ch = image.shape
+        q = QtGui.QImage(image.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888)
         self.image_label.setPixmap(QtGui.QPixmap.fromImage(q.scaled(w * 2, h * 2)))
 
     def send_trajectory_setpoint(self):

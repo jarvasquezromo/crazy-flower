@@ -39,6 +39,7 @@ URI = uri_helper.uri_from_env(default='radio://0/70/2M/E7E7E7E705')
 LOG_PERIOD_MS  = 50          # logging period (ms) → 20 Hz
 WINDOW_SIZE    = 10          # samples before AND after the keypress
 OUTPUT_FILE    = 'snapshots.csv'
+GATES_FILE     = 'gates_xyz.py'
 VARIABLES      = ['stateEstimate.x', 'stateEstimate.y',
                   'stateEstimate.z', 'stabilizer.yaw']
 SHORT_NAMES    = ['x', 'y', 'z', 'yaw']   # used in CSV headers
@@ -90,6 +91,46 @@ def write_snapshot(snapshot_id: int, trigger_ts: float,
             check = '✔' if VAR_ACCEPTED[i] >= float(row[names[1]]) else '✘'
             print(f"  {name:<6} {row[names[0]]:>12s} {row[names[1]]:>12s} {check:>6}")
     print(f'  → appended to {OUTPUT_FILE}\n')
+
+    # Only write a gate if x,y,z variances are within accepted thresholds.
+    good_xyz = all(
+        float(row[f'{name}_var']) <= VAR_ACCEPTED[idx]
+        for idx, name in enumerate(SHORT_NAMES[:3])
+    )
+    if good_xyz:
+        append_gate_point(
+            float(row['x_mean']),
+            float(row['y_mean']),
+            float(row['z_mean']),
+        )
+
+
+def append_gate_point(x: float, y: float, z: float) -> None:
+    line = f"  [{x:.2f}, {y:.2f}, {z:.2f}],\n"
+
+    if not os.path.isfile(GATES_FILE):
+        with open(GATES_FILE, 'w', newline='') as f:
+            f.write('[\n')
+            f.write(line)
+            f.write(']\n')
+        print(f'  → gate appended to {GATES_FILE}')
+        return
+
+    with open(GATES_FILE, 'r', newline='') as f:
+        lines = f.readlines()
+
+    if not lines:
+        lines = ['[\n', ']\n']
+
+    # Ensure trailing closing bracket exists, then insert before it.
+    if lines[-1].strip() != ']':
+        lines.append(']\n')
+    lines.insert(len(lines) - 1, line)
+
+    with open(GATES_FILE, 'w', newline='') as f:
+        f.writelines(lines)
+
+    print(f'  → gate appended to {GATES_FILE}')
 
 # ── Main logger class ─────────────────────────────────────────────────────────
 

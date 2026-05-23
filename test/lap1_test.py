@@ -338,7 +338,7 @@ class FPVWindow(QtWidgets.QWidget):
         self.cf.supervisor.send_arming_request(True)
 
         self._timer = QtCore.QTimer()
-        self._timer.timeout.connect(self._send_setpoint)
+        #self._timer.timeout.connect(self._send_setpoint)
         self._timer.setInterval(100)
         self._timer.start()
 

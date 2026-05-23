@@ -6,8 +6,9 @@ class Trajectory:
         self.segments = []
         self.segment_times = []
         self.coeffs = []
-        self.v_xy_max = 2.25
-        self.v_z_max = 0.75
+        self.slowdown = 0.5
+        self.v_xy_max = 2.25 * self.slowdown
+        self.v_z_max = 0.75 * self.slowdown
 
     def estimate_segment_time(self, p0, p1):
         """

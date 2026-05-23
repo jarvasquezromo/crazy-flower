@@ -11,15 +11,15 @@ class Follower:
 
         # constants for time scaling based on tracking error
 
-        self.min_lag = 0.2  # Distance threshold for full speed
+        self.min_lag = 0.1  # Distance threshold for full speed
         self.max_lag = 1  # Distance threshold for minimum speed
-        self.min_speed = 0.5  # Minimum time scale factor
+        self.min_speed = 0.35  # Minimum time scale factor
 
         # constants for trajectory following
         
         self.look_ahead = 0.05  # how far ahead in time on the trajectory to look for the setpoint
-        self.tau = 0.5  # feedforward for velocity in XY
-        self.tau_z = 0.20 # feedforward for velocity in Z
+        self.tau = 0.25  # feedforward for velocity in XY
+        self.tau_z = 0.2 # feedforward for velocity in Z
 
         
     def update_clock(self, current_real_time, current_pos):
