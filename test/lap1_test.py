@@ -22,9 +22,11 @@ Pipeline
    - The gate centre is the polygon's own area centroid (not the bounding box).
    - All passing candidates are kept; the controller uses the *rightmost* gate
      (largest centroid x) so the lap is taken consistently around the course.
-   - The image-plane error (ex, ey) and bbox width feed `_gate_to_world`, a
-     pinhole projection that turns the detection into a world-frame point using
-     the current yaw/position estimate and the known physical gate width.
+   - The image-plane error (ex, ey) and the gate's pixel *height* feed
+     `_gate_to_world`, a pinhole projection that turns the detection into a
+     world-frame point using the current yaw/position estimate and the fixed
+     physical gate height (gate width varies between gates, so it is not used
+     for ranging).
 
 3. State machine (`_send_setpoint`, runs at 10 Hz)
    WAIT     -> wait for the Kalman filter to converge, then arm the sequence.
@@ -199,7 +201,10 @@ GATE_MIN_SOLIDITY = 0.80   # area / convex-hull area: frame outline is near-conv
 GATE_APPROX_EPS   = 0.04   # approxPolyDP epsilon, fraction of perimeter
 
 # --- Camera / world-frame projection ---
-GATE_PHYS_W    = 0.8                 # metres, physical gate width for distance estimate
+DEBUG_GATE_POSE = True               # print per-stage gate pose values for debugging
+GATE_PHYS_H    = 0.8                 # metres, physical gate height — the only fixed dimension
+                                     # (gate width varies between gates and foreshortens with yaw);
+                                     # depth is derived from this height alone
 TRAJ_N_STEPS   = 5                   # number of waypoints in interpolated trajectory
 TRAJ_OVERSHOOT = 0.30                # metres past gate centre (to fly through cleanly)
 WAYPOINT_TOL   = 0.15                # metres, advance to next waypoint within this radius
@@ -225,8 +230,8 @@ def _order_corners(pts):
     """Order 4 image points as [TL, TR, BR, BL] (image y increases downward).
 
     TL/BR are the corners with the smallest/largest x+y; TR/BL the largest/
-    smallest x-y. This fixes a consistent correspondence with the gate's
-    physical object points so solvePnP returns a stable pose.
+    smallest x-y. A consistent corner order lets the side edges (TL-BL, TR-BR)
+    be measured for the gate's pixel height.
     """
     pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
     s = pts[:, 0] + pts[:, 1]
@@ -255,6 +260,25 @@ def _quad_corners(cnt, approx):
     if len(np.unique(np.round(ordered, 1), axis=0)) != 4:
         return None
     return ordered
+
+
+def _gate_pixel_height(corners):
+    """Vertical pixel extent of the gate from its two side edges (TL-BL, TR-BR).
+
+    Uses the side edges, not the bounding box, so it stays correct under tilt,
+    and uses *height* rather than width because a yaw off head-on foreshortens
+    the gate's width but leaves its height intact. Returns None if unusable.
+    """
+    if corners is None:
+        return None
+    c = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+    if c.shape[0] != 4:
+        return None
+    tl, tr, br, bl = c
+    left_h  = float(np.linalg.norm(bl - tl))
+    right_h = float(np.linalg.norm(br - tr))
+    h_px = 0.5 * (left_h + right_h)
+    return h_px if h_px > 1.0 else None
 
 
 def _gate_candidate(cnt, img_w, img_h):
@@ -312,7 +336,7 @@ def _gate_candidate(cnt, img_w, img_h):
         "ex": ex,
         "ey": ey,
         "approx": approx,
-        "corners": _quad_corners(cnt, approx),  # ordered TL/TR/BR/BL for solvePnP
+        "corners": _quad_corners(cnt, approx),  # ordered TL/TR/BR/BL for height measurement
     }
 
 
@@ -702,68 +726,34 @@ class FPVWindow(QtWidgets.QWidget):
                     f"yaw={self._est['yaw']:.1f} — leaving WAIT"
                 )
 
-    @staticmethod
-    def _gate_camera_pose(corners):
-        """Gate-centre position in the CAMERA frame via solvePnP, or None.
-
-        Uses the four detected gate corners and the known physical gate size,
-        with the calibrated intrinsics. The image is already undistorted, so
-        zero distortion is passed here (distortion must not be applied twice).
-        Returns (Xc, Yc, Zc) in the OpenCV camera frame: x right, y down,
-        z forward along the optical axis.
-        """
-        if corners is None:
-            return None
-        img_pts = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
-        if img_pts.shape[0] != 4:
-            return None
-        # Physical gate corners (planar, z=0) in the order SOLVEPNP_IPPE_SQUARE
-        # expects: TL/TR/BR/BL with object y pointing up. This matches the
-        # TL/TR/BR/BL image-corner order from _order_corners.
-        h = 0.5 * GATE_PHYS_W
-        obj = np.array([
-            [-h,  h, 0.0],   # TL
-            [ h,  h, 0.0],   # TR
-            [ h, -h, 0.0],   # BR
-            [-h, -h, 0.0],   # BL
-        ], dtype=np.float64)
-        try:
-            ok, _rvec, tvec = cv2.solvePnP(
-                obj, img_pts, _camera_matrix(), None, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-        except cv2.error:
-            return None
-        if not ok:
-            return None
-        t = tvec.reshape(3)
-        if not np.all(np.isfinite(t)) or t[2] <= 0.0:
-            return None
-        return float(t[0]), float(t[1]), float(t[2])
-
     def _gate_to_world(self, ex, ey, bbox, corners=None):
         """Project a gate detection to a world-frame point.
 
-        Preferred path: solvePnP on the four gate corners + known gate size
-        (uses the full calibration, handles perspective/tilt). Falls back to the
-        coarse bbox-width pinhole range estimate when the corners are missing or
-        the PnP solve is degenerate.
+        Depth comes from the gate's *pixel height*: a yaw off head-on
+        foreshortens the gate's width but not its height, so height is the
+        stable ranging dimension. Pinhole: Z = fy * GATE_PHYS_H / h_px. The
+        lateral/vertical offset is the calibrated back-projection of the gate
+        centroid at that depth. Falls back to the bbox-width pinhole when the
+        corners (hence the height) are unavailable.
         """
-        cam = self._gate_camera_pose(corners)
-        if cam is not None:
-            # Camera frame (x right, y down, z forward) -> body frame
-            # (x forward, y left, z up): the camera looks along +body_x.
-            xc, yc, zc = cam
-            dx_b =  zc
-            dy_b = -xc
-            dz_b = -yc
+        h_px = _gate_pixel_height(corners)
+        if h_px is not None:
+            dist = max(CAMERA_FY * GATE_PHYS_H / h_px, 0.3)
+            src = "height"
         else:
-            # Fallback: pinhole distance from bbox width (assumes fronto-parallel).
-            bw = bbox[2]
-            dist = max((GATE_PHYS_W * CAMERA_FX) / max(bw, 1), 0.3)
-            x_err_px = ex * max(0.5 * IMG_WIDTH, 1.0)
-            y_err_px = ey * max(0.5 * IMG_HEIGHT, 1.0)
-            dx_b =  dist
-            dy_b = -x_err_px * dist / CAMERA_FX
-            dz_b = -y_err_px * dist / CAMERA_FY
+            # Fallback (no corners): use the bbox HEIGHT, not width — gate width
+            # varies between gates and foreshortens, but height is fixed/known.
+            bh = bbox[3]
+            dist = max(CAMERA_FY * GATE_PHYS_H / max(bh, 1), 0.3)
+            src = "bbox-h"
+
+        # Direction from the gate centroid offset, back-projected at `dist`.
+        # Body frame: x forward, y left, z up (camera looks along +body_x).
+        x_err_px = ex * max(0.5 * IMG_WIDTH, 1.0)
+        y_err_px = ey * max(0.5 * IMG_HEIGHT, 1.0)
+        dx_b =  dist
+        dy_b = -x_err_px * dist / CAMERA_FX
+        dz_b = -y_err_px * dist / CAMERA_FY
 
         with self._pos_lock:
             yaw_r = np.deg2rad(self._est['yaw'])
@@ -771,6 +761,23 @@ class FPVWindow(QtWidgets.QWidget):
         gx = ox + dx_b * np.cos(yaw_r) - dy_b * np.sin(yaw_r)
         gy = oy + dx_b * np.sin(yaw_r) + dy_b * np.cos(yaw_r)
         gz = float(np.clip(oz + dz_b, MIN_HEIGHT, MAX_HEIGHT))
+
+        if DEBUG_GATE_POSE:
+            # Per-stage values so each step can be checked against ground truth.
+            # range = straight-line camera->gate distance; bw/bh = corner pixel
+            # span (compare bw vs bh to see yaw foreshortening).
+            rng = float(np.sqrt(dx_b**2 + dy_b**2 + dz_b**2))
+            bw_px = bh_px = -1.0
+            if corners is not None:
+                c = np.asarray(corners, np.float64).reshape(-1, 2)
+                bw_px = float(c[:, 0].max() - c[:, 0].min())
+                bh_px = float(c[:, 1].max() - c[:, 1].min())
+            print(
+                f"[gate {src}] px(w={bw_px:.0f} h={bh_px:.0f}) "
+                f"body(fwd={dx_b:+.2f} left={dy_b:+.2f} up={dz_b:+.2f}) "
+                f"range={rng:.2f}m | drone(x={ox:.2f} y={oy:.2f} z={oz:.2f} "
+                f"yaw={np.degrees(yaw_r):.0f}) -> gate(x={gx:.2f} y={gy:.2f} z={gz:.2f})"
+            )
         return gx, gy, gz
 
     def _build_traj(self, gate):
