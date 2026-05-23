@@ -514,7 +514,8 @@ class FPVWindow(QtWidgets.QWidget):
             return
 
         if not self._log_ready:
-            # Kalman filter not yet converged — hold still and wait.
+            # Wait for the first Lighthouse position sample so the commanded
+            # position is seeded from the real estimate (not world-origin).
             return
 
         if self._gate_state == "WAIT":
@@ -643,8 +644,9 @@ class FPVWindow(QtWidgets.QWidget):
             self._est['z']   = data['stateEstimate.z']
             self._est['yaw'] = data['stabilizer.yaw']
             if not self._log_ready:
-                # Seed commanded position from first real estimate so the drone
-                # holds its current position rather than jumping to world-origin.
+                # Seed commanded position from the first Lighthouse estimate so
+                # the drone holds its current position rather than jumping to
+                # world-origin, then takeoff can begin immediately.
                 self._pos['x']   = self._est['x']
                 self._pos['y']   = self._est['y']
                 self._pos['z']   = self._est['z']
@@ -692,16 +694,9 @@ class FPVWindow(QtWidgets.QWidget):
             QtCore.Q_ARG(str, text))
 
     def _connected(self, uri):
-        self._set_status(f'Connected to {uri} — resetting Kalman filter…')
-        # Reset the Kalman filter so the Lighthouse geometry is used as the
-        # reference frame from a clean state, then wait for it to converge.
-        try:
-            self.cf.param.set_value('kalman.resetEstimation', '1')
-            time.sleep(0.1)
-            self.cf.param.set_value('kalman.resetEstimation', '0')
-            time.sleep(1.5)
-        except Exception as e:
-            print(f'Kalman reset failed: {e}')
+        # No Kalman reset: the Lighthouse already provides an absolute, converged
+        # position estimate. Resetting would discard it and force a reconvergence
+        # wait. Just start logging and take off using the current estimate.
         self._set_status(f'Connected to {uri}')
         self._setup_log()
 
