@@ -203,7 +203,7 @@ GATE_PHYS_W    = 0.8                 # metres, physical gate width for distance 
 TRAJ_N_STEPS   = 5                   # number of waypoints in interpolated trajectory
 TRAJ_OVERSHOOT = 0.30                # metres past gate centre (to fly through cleanly)
 WAYPOINT_TOL   = 0.15                # metres, advance to next waypoint within this radius
-PASS_AREA_FRAC = 0.25                # gate bbox / image area threshold → gate passed
+PASS_AREA_FRAC = 0.15                # gate bbox / image area threshold → gate passed
 CHASE_TIMEOUT  = 8.0                 # seconds before giving up and returning to SEARCH
 GATE_EMA_ALPHA = 0.35                # weight for EMA update of locked gate position
 
@@ -680,6 +680,7 @@ class FPVWindow(QtWidgets.QWidget):
         gx = ox + dx_b * np.cos(yaw_r) - dy_b * np.sin(yaw_r)
         gy = oy + dx_b * np.sin(yaw_r) + dy_b * np.cos(yaw_r)
         gz = float(np.clip(oz + dz_b, MIN_HEIGHT, MAX_HEIGHT))
+        print(f"Gate detected: ex={ex:.2f} ey={ey:.2f} dist={dist:.2f} → world gx={gx:.2f} gy={gy:.2f} gz={gz:.2f}")
         return gx, gy, gz
 
     def _build_traj(self, gate):
