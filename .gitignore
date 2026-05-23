@@ -221,6 +221,7 @@ __marimo__/
 .vscode
 
 # cache
+cache
 */cache/
 */snapshots.csv
 */recordings/

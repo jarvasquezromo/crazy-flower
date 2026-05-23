@@ -251,7 +251,7 @@ def main():
         status    = f"Captured: {len(obj_pts)}/{MIN_FRAMES}  {board_str}{rms_str}"
         cv2.putText(disp, status, (6, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
-        cv2.imshow('Calibration — AI-deck', disp)
+        cv2.imshow('Calibration: AI-deck', disp)
 
         # --- Debug window: 4 panels at uniform size ---
         # Shows each stage so you can see where detection breaks down.
@@ -268,7 +268,7 @@ def main():
             _panel(big,   f'3-upscale x{DETECT_SCALE}'),
             _panel(thr,   '4-adaptive thr (detector view)'),
         ])
-        cv2.imshow('Debug — calibration pipeline', row)
+        cv2.imshow('Debug: calibration pipeline', row)
 
         key = cv2.waitKey(delay_ms) & 0xFF
 
