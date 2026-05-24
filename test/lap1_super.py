@@ -31,6 +31,9 @@ AIDECK_PORT = 5000
 LOCAL_PORT = 5001
 START_MAGIC = b'FER'
 
+COURSE_CENTER_X = 1.15
+COURSE_CENTER_Y = 0.0
+
 CPX_HEADER_SIZE = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE = 11
@@ -70,7 +73,7 @@ class Surveyer:
         self.stabilization_wait_duration = 0.35
         self.stabilization_start_time = None
         self.stabilization_context = None
-        self.mapping_radii = [1.5, 2.5, 3.5]
+        self.mapping_radii = [1, 1.5, 2]
         self.mapping_radius_idx = 0
         self.height_offset = 0.0
         self.angle_offset = 0.0
@@ -248,8 +251,8 @@ class Surveyer:
             radius = self.mapping_radii[self.mapping_radius_idx]
 
         angle = position_id * (np.pi / 3) + np.pi / 6 - np.pi
-        target_y = 4.0 + np.sin(angle) * radius
-        target_x = 4.0 + np.cos(angle) * radius
+        target_y = COURSE_CENTER_Y + np.sin(angle) * radius
+        target_x = COURSE_CENTER_X + np.cos(angle) * radius
         target_z = 1.35
         target_yaw = angle + np.pi / 2 + np.pi / 6
 
@@ -264,7 +267,7 @@ class Surveyer:
         self.angle_offset = np.random.uniform(-np.pi / 12, np.pi / 12)
 
     @staticmethod
-    def segment_from_xy(x, y, center_x=4.0, center_y=4.0):
+    def segment_from_xy(x, y, center_x=COURSE_CENTER_X, center_y=COURSE_CENTER_Y):
         dx = float(x) - center_x
         dy = float(y) - center_y
 
@@ -482,6 +485,11 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_frame = None
         self._last_ctrl_time = time.monotonic()
         self._log_ready = False
+        self._cmd_pos = None
+        self._max_xy_speed = 0.6
+        self._max_z_speed = 0.4
+        self._max_yaw_rate = 60.0
+        self._debug_last = 0.0
 
         cflib.crtp.init_drivers()
         self.cf = Crazyflie(ro_cache=None, rw_cache='cache')
@@ -545,7 +553,30 @@ class FPVWindow(QtWidgets.QWidget):
         }
 
         cmd = self._controller.compute_command(sensor_data, camera_data, dt)
-        self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'] = cmd
+        self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'] = self._ramp_setpoint(cmd, dt)
+
+        if now - self._debug_last >= 0.5:
+            self._debug_last = now
+            mapping_progress = int(self._controller.surveyer.mapping_progress)
+            gate_to_go = int(self._controller.surveyer.gate_to_go)
+            print(
+                "gate={} prog={} | pos=({:.2f},{:.2f},{:.2f}) yaw={:.1f} | cmd=({:.2f},{:.2f},{:.2f},{:.1f}) | sp=({:.2f},{:.2f},{:.2f},{:.1f})".format(
+                    gate_to_go,
+                    mapping_progress,
+                    est['x'],
+                    est['y'],
+                    est['z'],
+                    est['yaw'],
+                    float(cmd[0]),
+                    float(cmd[1]),
+                    float(cmd[2]),
+                    float(cmd[3]),
+                    self._pos['x'],
+                    self._pos['y'],
+                    self._pos['z'],
+                    self._pos['yaw'],
+                )
+            )
 
         # Update the top-down map using the latest estimate.
         gate_index = min(self._controller.surveyer.gate_to_go + 1, 5)
@@ -575,6 +606,36 @@ class FPVWindow(QtWidgets.QWidget):
             float(self._pos['z']),
             float(self._pos['yaw']),
         )
+
+    def _ramp_setpoint(self, cmd, dt):
+        if self._cmd_pos is None:
+            self._cmd_pos = [float(cmd[0]), float(cmd[1]), float(cmd[2]), float(cmd[3])]
+            return list(self._cmd_pos)
+
+        dt = max(float(dt), 1e-3)
+        target = np.array([float(cmd[0]), float(cmd[1]), float(cmd[2])], dtype=float)
+        current = np.array(self._cmd_pos[:3], dtype=float)
+        delta = target - current
+
+        max_xy_step = self._max_xy_speed * dt
+        max_z_step = self._max_z_speed * dt
+        xy_step = delta[:2]
+        xy_norm = float(np.linalg.norm(xy_step))
+        if xy_norm > max_xy_step:
+            xy_step = xy_step * (max_xy_step / max(xy_norm, 1e-6))
+        z_step = float(np.clip(delta[2], -max_z_step, max_z_step))
+
+        next_pos = current + np.array([xy_step[0], xy_step[1], z_step], dtype=float)
+
+        yaw_target = float(cmd[3])
+        yaw_current = float(self._cmd_pos[3])
+        yaw_diff = np.arctan2(np.sin(yaw_target - yaw_current), np.cos(yaw_target - yaw_current))
+        max_yaw_step = np.deg2rad(self._max_yaw_rate) * dt
+        yaw_step = float(np.clip(yaw_diff, -max_yaw_step, max_yaw_step))
+        next_yaw = yaw_current + yaw_step
+
+        self._cmd_pos = [float(next_pos[0]), float(next_pos[1]), float(next_pos[2]), float(next_yaw)]
+        return list(self._cmd_pos)
 
     def _set_status(self, text):
         QtCore.QMetaObject.invokeMethod(
