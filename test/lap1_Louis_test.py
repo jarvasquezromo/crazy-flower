@@ -253,6 +253,15 @@ GATE_EMA_ALPHA = 0.35  # smoothing factor when refining a locked gate pose
 # drone advances a small amount.
 BLIND_PUSH_TIMEOUT = 1.5  # seconds since last seen to allow blind push
 
+# --- Slow-hardware command gating (real flight: vision can be 1-2 FPS) ---
+CHASE_PUSH_CMD_HZ = 5.0  # command rate limit in CHASE/PUSH
+CHASE_PUSH_CMD_DT = 1.0 / CHASE_PUSH_CMD_HZ
+CHASE_PUSH_SETTLE_S = 0.35  # wait this long after entering CHASE/PUSH
+CMD_IMMEDIATE_MIN_DT = 0.08  # avoid bursts even when significant changes happen
+CMD_IMMEDIATE_POS_JUMP = 0.15  # m; immediate send if target position jumps
+CMD_IMMEDIATE_YAW_JUMP = 10.0  # deg; immediate send if target yaw jumps
+CMD_IMMEDIATE_AREA_JUMP = 0.03  # area fraction delta for immediate send
+
 
 @contextlib.contextmanager
 def _muted_stderr():
@@ -623,7 +632,28 @@ class FPVWindow(QtWidgets.QWidget):
         self._state_t0 = time.monotonic()
         self._gates_passed = 0
         self._vision_lock = threading.Lock()
-        self._vision = {"found": False, "ex": 0.0, "ey": 0.0, "bbox": None, "area": 0.0}
+        self._vision = {
+            "found": False,
+            "ex": 0.0,
+            "ey": 0.0,
+            "bbox": None,
+            "area": 0.0,
+            "seq": 0,
+        }
+
+        # Command throttling state for slow hardware (vision 1-2 FPS).
+        self._vision_seq = 0
+        self._last_sent_vision_seq = -1
+        self._last_cmd_sent_time = 0.0
+        self._last_cmd_state = None
+        self._cmd_hold_until = 0.0
+        self._last_cmd_target = {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "yaw": 0.0,
+            "area": 0.0,
+        }
 
         self._last_ctrl_time = time.monotonic()
 
@@ -656,6 +686,7 @@ class FPVWindow(QtWidgets.QWidget):
         color = _undistort_image(color)
 
         det = _detect_green_gate(color)
+        self._vision_seq += 1
         with self._vision_lock:
             self._vision = {
                 "found": bool(det.get("found", False)),
@@ -665,6 +696,7 @@ class FPVWindow(QtWidgets.QWidget):
                 "area": float(det.get("area", 0.0)),
                 "corners": det.get("corners", None),
                 "candidates": det.get("candidates", []),
+                "seq": self._vision_seq,
             }
 
         # Debug overlay on the RGB image: candidates thin/yellow, selected thick/green.
@@ -734,6 +766,7 @@ class FPVWindow(QtWidgets.QWidget):
         now = time.monotonic()
         dt = float(np.clip(now - self._last_ctrl_time, 0.02, 0.3))
         self._last_ctrl_time = now
+        significant_update = False
 
         if self._gate_state == "STOP":
             # Safety brake: command zero velocity (hold in place, no motion).
@@ -754,6 +787,7 @@ class FPVWindow(QtWidgets.QWidget):
             area = float(self._vision.get("area", 0.0))
             corners = self._vision.get("corners", None)
             candidates = list(self._vision.get("candidates", []))
+            vision_seq = int(self._vision.get("seq", 0))
         with self._pos_lock:
             est = dict(self._est)
 
@@ -831,6 +865,7 @@ class FPVWindow(QtWidgets.QWidget):
                     self._chase_area_stall = 0
                     self._gate_state = "CHASE"
                     self._state_t0 = now
+                    significant_update = True
             else:
                 self._search_confirm = []
 
@@ -872,6 +907,7 @@ class FPVWindow(QtWidgets.QWidget):
                         self._gate_wp_idx = min(
                             self._gate_wp_idx, len(self._gate_waypoints) - 1
                         )
+                        significant_update = True
                     # record the time we last saw a usable target
                     self._last_seen_time = now
                 else:
@@ -913,6 +949,7 @@ class FPVWindow(QtWidgets.QWidget):
                         and self._gate_wp_idx < len(self._gate_waypoints) - 1
                     ):
                         self._gate_wp_idx += 1
+                        significant_update = True
                     area_frac = area / img_area if img_area > 0 else 0.0
                     if area_frac > PASS_AREA_FRAC:
                         yaw_r = np.deg2rad(est["yaw"])
@@ -927,6 +964,7 @@ class FPVWindow(QtWidgets.QWidget):
                         self._push_confirm = 0
                         self._chase_best_area_frac = 0.0
                         self._chase_area_stall = 0
+                        significant_update = True
                 else:
                     # No waypoint path yet: hold and keep refining the target.
                     self._pos["x"] = est["x"]
@@ -949,6 +987,7 @@ class FPVWindow(QtWidgets.QWidget):
                 self._chase_area_stall = 0
                 self._gate_state = "CHASE"
                 self._state_t0 = now
+                significant_update = True
             else:
                 # Scan up, down, back to original height, then yaw right/left.
                 t = now - self._state_t0
@@ -1016,12 +1055,64 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gate_state = "SEARCH"
                 self._last_seen_time = None
                 self._state_t0 = now
+                significant_update = True
 
-        # Apply the computed body-frame command + height setpoint.
+        # Apply command with slow-hardware gating in CHASE/PUSH.
+        send_now = True
+        slow_state = self._gate_state in ("CHASE", "PUSH")
+        if slow_state:
+            last = self._last_cmd_target
+            pos_jump = float(
+                np.linalg.norm(
+                    np.array([self._pos["x"], self._pos["y"], self._pos["z"]])
+                    - np.array([last["x"], last["y"], last["z"]])
+                )
+            )
+            yaw_jump = abs(((self._pos["yaw"] - last["yaw"] + 180.0) % 360.0) - 180.0)
+            area_frac = area / img_area if img_area > 0 else 0.0
+            area_jump = abs(area_frac - last["area"])
+            new_frame = vision_seq != self._last_sent_vision_seq
+            state_changed = self._last_cmd_state != self._gate_state
+
+            if state_changed:
+                self._cmd_hold_until = now + CHASE_PUSH_SETTLE_S
+
+            immediate_ok = (
+                state_changed
+                or significant_update
+                or (
+                    new_frame
+                    and (
+                        pos_jump >= CMD_IMMEDIATE_POS_JUMP
+                        or yaw_jump >= CMD_IMMEDIATE_YAW_JUMP
+                        or area_jump >= CMD_IMMEDIATE_AREA_JUMP
+                    )
+                )
+            )
+            elapsed = now - self._last_cmd_sent_time
+            if immediate_ok and elapsed >= CMD_IMMEDIATE_MIN_DT:
+                send_now = True
+            elif now >= self._cmd_hold_until and elapsed >= CHASE_PUSH_CMD_DT:
+                send_now = True
+            else:
+                send_now = False
+
+        # Apply the computed world-frame position + yaw setpoint.
         self._pos["z"] = float(np.clip(self._pos["z"], MIN_HEIGHT, MAX_HEIGHT))
-        self.cf.commander.send_position_setpoint(
-            self._pos["x"], self._pos["y"], self._pos["z"], self._pos["yaw"]
-        )
+        if send_now:
+            self.cf.commander.send_position_setpoint(
+                self._pos["x"], self._pos["y"], self._pos["z"], self._pos["yaw"]
+            )
+            self._last_cmd_sent_time = now
+            self._last_cmd_state = self._gate_state
+            self._last_sent_vision_seq = vision_seq
+            self._last_cmd_target = {
+                "x": self._pos["x"],
+                "y": self._pos["y"],
+                "z": self._pos["z"],
+                "yaw": self._pos["yaw"],
+                "area": area / img_area if img_area > 0 else 0.0,
+            }
 
     def _return_to_last_chase_gate_pose(self, est, dt):
         tx, ty, th = self._last_chase_gate_pose
