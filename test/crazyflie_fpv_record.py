@@ -224,7 +224,7 @@ class FPVWindow(QtWidgets.QWidget):
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         filepath = os.path.join(RECORDINGS_DIR, f'fpv_{timestamp}.mp4')
 
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         self._video_writer = cv2.VideoWriter(
             filepath, fourcc, RECORDING_FPS, (IMG_WIDTH, IMG_HEIGHT))
 
