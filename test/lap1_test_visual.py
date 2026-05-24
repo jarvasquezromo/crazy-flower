@@ -165,7 +165,7 @@ CENTER_TOL_X = 0.10          # normalized (0..1) horizontal tolerance
 CENTER_TOL_Y = 0.12          # normalized (0..1) vertical tolerance
 
 # Slow & robust profile: gentle yaw scan, gentle servo gains.
-SEARCH_YAWRATE = -12.0      # deg/s, negative = turn left (slow ~30 s full scan)
+SEARCH_YAWRATE = 12.0      # deg/s, negative = turn left (slow ~30 s full scan)
 MAX_YAWRATE = 40.0           # deg/s
 K_YAW = 50.0                 # deg/s per normalized x error
 
