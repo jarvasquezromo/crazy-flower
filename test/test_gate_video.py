@@ -597,16 +597,16 @@ def main():
         h, w = overlay.shape[:2]
         cv2.drawMarker(overlay, (w // 2, h // 2), (255, 255, 255), cv2.MARKER_CROSS, 14, 1)
 
-        # Draw every accepted candidate thin/yellow; the selected (rightmost) thick/green.
+        # Draw the detected polygon for every accepted candidate (no bounding
+        # box): thin/yellow, with the selected (rightmost) gate thick/green.
         sel_bbox = det.get("bbox")
         for cand in det.get("candidates", []):
-            cx_b, cy_b, bw_b, bh_b = cand["bbox"]
+            if cand.get("approx") is None:
+                continue
             is_sel = (cand["bbox"] == sel_bbox)
             color = (0, 255, 0) if is_sel else (255, 255, 0)
             thick = 2 if is_sel else 1
-            cv2.rectangle(overlay, (cx_b, cy_b), (cx_b + bw_b, cy_b + bh_b), color, thick)
-            if cand.get("approx") is not None:
-                cv2.polylines(overlay, [cand["approx"]], True, color, thick)
+            cv2.polylines(overlay, [cand["approx"]], True, color, thick)
 
         if det.get("found", False) and sel_bbox is not None:
             cv2.circle(overlay, (int(round(det["cx"])), int(round(det["cy"]))), 4, (255, 0, 0), -1)
