@@ -1,61 +1,46 @@
 #!/usr/bin/env python3
-"""Autonomous gate-flying lap for the Crazyflie + AI-deck.
+"""Autonomous gate-flying lap for the Crazyflie + AI-deck — *visual control*.
 
-The drone streams JPEG frames from the AI-deck over Wi-Fi/UDP, detects green
-race gates in each frame, and flies through them one after another using the
-Lighthouse/Kalman world-frame estimate for positioning.
+This is a variant of ``lap1_test.py``. It keeps the same gate detection and the
+same zone-validation logic (the vision estimate must fall inside the expected
+gate's angular zone before the gate is chased), but it does **not** fly to a
+world-frame trajectory. Instead the drone is flown straight through the gate by
+*visual servoing* on the image errors:
 
-Pipeline
---------
-1. Video link (`UdpVideoThread`)
-   Connects to the AI-deck (192.168.4.1:5000), reassembles the CPX/JPEG image
-   stream, decodes each frame to RGB, and emits it to the Qt GUI. The first
-   frame's size selects/scales the camera calibration (`calibration.json`).
+  * yaw rate     <- horizontal centroid error (ex)
+  * height       <- vertical centroid error   (ey)
+  * small lateral nudge <- horizontal error   (ex)
+  * forward speed -> approach while the gate is reasonably centred
 
-2. Gate detection (`_detect_green_gate`, `_gate_candidate`)
-   - Threshold the (undistorted) image into a binary mask of bright pixels and
-     morphologically close it.
-   - For every contour, validate it as a *gate-shaped polygon*: approximate it
-     with `approxPolyDP` and require a near-quad vertex count, a roughly square
-     aspect ratio, and high solidity (near-convex outline). This rejects blobs
-     that are bright but not gate-like.
-   - The gate centre is the polygon's own area centroid (not the bounding box).
-   - All passing candidates are kept; the controller uses the *rightmost* gate
-     (largest centroid x) so the lap is taken consistently around the course.
-   - The four gate corners feed `_gate_to_world`, which back-projects each
-     corner to a viewing ray (camera intrinsics), rotates the rays into the
-     world with the drone's full attitude quaternion (so camera pitch/roll are
-     accounted for, not just yaw), and recovers metric depth by enforcing that
-     each vertical gate edge is a vertical segment of known physical height
-     (GATE_PHYS_H). The gate centre is the mean of the four world corners.
-     (Ported from petr_assignment.py's Surveyer.pixels_to_world.)
+The world-frame projection (`_gate_to_world`) is still computed, but only to
+validate/snap the detection into the expected gate's zone and to drive the
+top-down map — never to position the drone. Commands are body-frame velocity +
+absolute-height setpoints (`send_hover_setpoint`), exactly like ``lap1.py``.
 
-3. State machine (`_send_setpoint`, runs at 10 Hz)
-   WAIT     -> wait for the Kalman filter to converge, then arm the sequence.
-   TAKEOFF  -> ramp the height setpoint up to SEARCH_HEIGHT.
-   SEARCH   -> yaw slowly in place until a gate is detected; on detection, lock
-               its world position, build a straight fly-through trajectory
-               (with overshoot) and switch to CHASE.
-   CHASE    -> follow the trajectory waypoints while continuously refining the
-               locked gate position (EMA) and pointing yaw at the gate. Times
-               out back to SEARCH if the gate is lost for CHASE_TIMEOUT seconds.
-               When the gate fills the frame (area fraction > PASS_AREA_FRAC),
-               commit to a push.
-   PUSH     -> drive straight through the gate to an overshoot point for
-               PUSH_DURATION_S, then count the gate and return to SEARCH
-               (or DONE once MAX_GATES gates have been passed).
-   DONE     -> stop setpoints and halt.
+State machine (`_send_setpoint`, runs at ~50 Hz)
+------------------------------------------------
+  WAIT     -> wait for the Kalman filter to converge, then arm the sequence.
+  TAKEOFF  -> ramp the height setpoint up to SEARCH_HEIGHT.
+  SEARCH   -> yaw slowly in place until a gate is detected *and* its world
+              estimate snaps into the expected gate's zone; then switch to
+              CHASE. Stray bright blobs outside the zone are ignored.
+  CHASE    -> visually servo the drone toward the gate (yaw/height/lateral) and
+              creep forward. Keep validating the detection against the zone for
+              the map. Times out back to SEARCH if the gate is lost for
+              CHASE_TIMEOUT seconds. When the gate fills the frame
+              (area fraction > PASS_AREA_FRAC), commit to a push.
+  PUSH     -> drive straight forward for PUSH_DURATION_S, then count the gate
+              and return to SEARCH (or DONE once MAX_GATES gates have passed).
+  DONE     -> stop setpoints and halt.
+  STOP     -> safety brake: continuously command zero velocity. Entered with
+              the Escape key.
 
-   STOP     -> safety brake: continuously command zero velocity (hover, no
-               motion). Entered with the Escape key.
-
-   Setpoints are sent as world-frame position+yaw commands. Arrow keys / WASD
-   allow manual nudging, Escape engages the zero-velocity safety brake, and
-   Space aborts hard (cut motors + DONE).
+  Arrow keys / WASD allow manual nudging, Escape engages the zero-velocity
+  safety brake, and Space aborts hard (cut motors + DONE).
 
 Usage
 -----
-  python3 crazy-flower/test/lap1_test.py
+  python3 crazy-flower/test/lap1_test_visual.py
 Set the radio URI via the CRAZYFLIE_URI env var (default radio://0/70/2M/...).
 """
 import contextlib
@@ -95,7 +80,6 @@ IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE = 11
 MIN_JPEG_BYTES = 5000
 CALIBRATION_PATH = os.path.join(os.path.dirname(__file__), 'calibration.json')
-DETECTION_LOG_PATH = os.path.join(os.path.dirname(__file__), 'gate_detections.json')
 
 
 def _load_calibration():
@@ -183,6 +167,12 @@ SEARCH_YAWRATE = -20.0      # deg/s, negative = turn left (full scan in ~18 s)
 MAX_YAWRATE = 70.0           # deg/s
 K_YAW = 80.0                 # deg/s per normalized x error
 
+# --- Visual-servo gains (used in CHASE) ---
+K_LATERAL = 0.15             # m/s body-Y per normalized x error
+MAX_LATERAL = 0.20           # m/s lateral clamp
+CHASE_FORWARD = 0.30         # m/s forward creep while approaching a gate
+ALIGN_FALLOFF = 0.60         # |ex| at which forward creep is fully suppressed
+
 FORWARD_SPEED = 0.35         # m/s in body X, during push-through
 PUSH_DURATION_S = 1.0
 SEARCH_HEIGHT = 0.8          # meters, target height for search/center
@@ -205,19 +195,13 @@ GATE_ASPECT_MAX   = 2.2
 GATE_MIN_SOLIDITY = 0.80   # area / convex-hull area: frame outline is near-convex
 GATE_APPROX_EPS   = 0.04   # approxPolyDP epsilon, fraction of perimeter
 
-# --- Camera / world-frame projection ---
+# --- Camera / world-frame projection (zone validation + map only) ---
 DEBUG_GATE_POSE = True               # print per-stage gate pose values for debugging
 GATE_PHYS_H    = 0.4                 # metres, physical gate height — the only fixed dimension
                                      # (gate width varies between gates and foreshortens with yaw);
                                      # depth is derived from this height alone
-GATE_BORDER_MARGIN     = 15          # px; reject gates whose corners touch the frame edge
-VERT_PAIR_RESIDUAL_MAX = 0.05        # m; max residual of the vertical-edge metric solve
-TRAJ_N_STEPS   = 5                   # number of waypoints in interpolated trajectory
-TRAJ_OVERSHOOT = 0.30                # metres past gate centre (to fly through cleanly)
-WAYPOINT_TOL   = 0.15                # metres, advance to next waypoint within this radius
 PASS_AREA_FRAC = 0.15                # gate bbox / image area threshold → gate passed
 CHASE_TIMEOUT  = 8.0                 # seconds before giving up and returning to SEARCH
-GATE_EMA_ALPHA = 0.35                # weight for EMA update of locked gate position
 
 
 @contextlib.contextmanager
@@ -233,116 +217,59 @@ def _muted_stderr():
         os.close(saved)
 
 
-def _order_points(pts):
+def _order_corners(pts):
     """Order 4 image points as [TL, TR, BR, BL] (image y increases downward).
 
-    Sort by y to split into the top and bottom pairs, then sort each pair by x.
-    Robust for rotated quads (unlike an x+/-y diagonal sort, which can mis-order
-    near-45-degree rotations). Ported from petr_assignment.Surveyer.order_points.
+    TL/BR are the corners with the smallest/largest x+y; TR/BL the largest/
+    smallest x-y. A consistent corner order lets the side edges (TL-BL, TR-BR)
+    be measured for the gate's pixel height.
     """
     pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
-    pts = pts[np.argsort(pts[:, 1])]
-    top = pts[:2]
-    bottom = pts[2:]
-    top = top[np.argsort(top[:, 0])]
-    bottom = bottom[np.argsort(bottom[:, 0])]
-    return np.array([top[0], top[1], bottom[1], bottom[0]], dtype=np.float64)
+    s = pts[:, 0] + pts[:, 1]
+    d = pts[:, 0] - pts[:, 1]
+    ordered = np.array([
+        pts[np.argmin(s)],   # TL
+        pts[np.argmax(d)],   # TR
+        pts[np.argmax(s)],   # BR
+        pts[np.argmin(d)],   # BL
+    ], dtype=np.float64)
+    return ordered
 
 
-def _gate_corners_robust(cnt):
-    """Four gate corners from a contour via convex hull + multi-epsilon approx.
-
-    Tries an increasing approxPolyDP tolerance until the hull reduces to a clean
-    quadrilateral, which is far more reliable than a single fixed epsilon.
-    Returns an unordered (4, 2) float array or None. Ported from
-    petr_assignment.Surveyer.get_gate_corners.
-    """
-    hull = cv2.convexHull(cnt)
-    peri = cv2.arcLength(hull, True)
-    if peri < 1e-6:
-        return None
-    for eps in (0.01, 0.015, 0.02, 0.03, 0.04, 0.06, 0.08, 0.1):
-        approx = cv2.approxPolyDP(hull, eps * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(-1, 2).astype(np.float64)
-    return None
-
-
-def _quad_corners(cnt, approx=None):
+def _quad_corners(cnt, approx):
     """Best 4-corner estimate of a gate quad, ordered TL/TR/BR/BL.
 
-    Uses the robust hull+multi-epsilon finder, falling back to the rotated
+    Uses the polygon approximation directly when it is a clean quad (keeps the
+    true perspective of the four corners); otherwise falls back to the rotated
     min-area rectangle. Returns None if the 4 corners are not distinct.
     """
-    pts = _gate_corners_robust(cnt)
-    if pts is None:
+    if len(approx) == 4:
+        pts = approx.reshape(-1, 2).astype(np.float64)
+    else:
         pts = cv2.boxPoints(cv2.minAreaRect(cnt)).astype(np.float64)
-    ordered = _order_points(pts)
+    ordered = _order_corners(pts)
     if len(np.unique(np.round(ordered, 1), axis=0)) != 4:
         return None
     return ordered
 
 
-def _gate_fully_in_frame(corners, img_w, img_h, margin=GATE_BORDER_MARGIN):
-    """True if every corner sits at least `margin` px inside the image.
+def _gate_pixel_height(corners):
+    """Vertical pixel extent of the gate from its two side edges (TL-BL, TR-BR).
 
-    A gate clipped by the frame edge has corners that no longer mark the real
-    opening, so its metric size (hence depth) is unreliable — reject it for
-    pose estimation. Ported from Surveyer.is_gate_fully_contained_in_screen.
+    Uses the side edges, not the bounding box, so it stays correct under tilt,
+    and uses *height* rather than width because a yaw off head-on foreshortens
+    the gate's width but leaves its height intact. Returns None if unusable.
     """
+    if corners is None:
+        return None
     c = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
-    if np.any(c[:, 0] < margin) or np.any(c[:, 0] > img_w - margin):
-        return False
-    if np.any(c[:, 1] < margin) or np.any(c[:, 1] > img_h - margin):
-        return False
-    return True
-
-
-def _quat_to_rot(qx, qy, qz, qw):
-    """Body->world rotation matrix from a (qx, qy, qz, qw) quaternion."""
-    q = np.array([qx, qy, qz, qw], dtype=np.float64)
-    n = np.linalg.norm(q)
-    if n < 1e-12:
-        return np.eye(3)
-    qx, qy, qz, qw = q / n
-    return np.array([
-        [1 - 2 * qy**2 - 2 * qz**2, 2 * qx * qy - 2 * qz * qw, 2 * qx * qz + 2 * qy * qw],
-        [2 * qx * qy + 2 * qz * qw, 1 - 2 * qx**2 - 2 * qz**2, 2 * qy * qz - 2 * qx * qw],
-        [2 * qx * qz - 2 * qy * qw, 2 * qy * qz + 2 * qx * qw, 1 - 2 * qx**2 - 2 * qy**2],
-    ], dtype=np.float64)
-
-
-def _pixel_ray_body(u, v):
-    """Unit viewing ray (body frame) for image pixel (u, v).
-
-    Body frame: x forward (optical axis), y left, z up. Uses the calibrated
-    intrinsics rather than a single fov-derived focal length.
-    """
-    x_img = (u - CAMERA_CX) / CAMERA_FX
-    y_img = (v - CAMERA_CY) / CAMERA_FY
-    ray = np.array([1.0, -x_img, -y_img], dtype=np.float64)
-    return ray / np.linalg.norm(ray)
-
-
-def _solve_vertical_pair(ray_top, ray_bottom, cam_pos, real_height):
-    """Metric depth of a vertical gate edge from its top/bottom corner rays.
-
-    Solves for the two ray scales (depths) such that the world points differ
-    only in z by exactly `real_height` (i.e. the edge is a vertical segment of
-    known length). Returns (top_world, bottom_world) or None if the solve is
-    rank-deficient, gives a non-positive depth, or fits poorly. Ported from
-    Surveyer.pixels_to_world.solve_vertical_pair.
-    """
-    A = np.column_stack((ray_top, -ray_bottom))
-    b = np.array([0.0, 0.0, real_height], dtype=np.float64)
-    sol, _residuals, rank, _sv = np.linalg.lstsq(A, b, rcond=None)
-    if rank < 2 or np.any(~np.isfinite(sol)) or np.any(sol <= 0.0):
+    if c.shape[0] != 4:
         return None
-    if np.linalg.norm(A @ sol - b) > VERT_PAIR_RESIDUAL_MAX:
-        return None
-    top_world = cam_pos + sol[0] * ray_top
-    bottom_world = cam_pos + sol[1] * ray_bottom
-    return top_world, bottom_world
+    tl, tr, br, bl = c
+    left_h  = float(np.linalg.norm(bl - tl))
+    right_h = float(np.linalg.norm(br - tr))
+    h_px = 0.5 * (left_h + right_h)
+    return h_px if h_px > 1.0 else None
 
 
 def _gate_candidate(cnt, img_w, img_h):
@@ -511,7 +438,7 @@ class UdpVideoThread(QtCore.QThread):
 class FPVWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Crazyflie FPV')
+        self.setWindowTitle('Crazyflie FPV — visual control')
 
         self.image_label = QtWidgets.QLabel()
         self.status_label = QtWidgets.QLabel('Connecting...')
@@ -529,31 +456,29 @@ class FPVWindow(QtWidgets.QWidget):
         layout.addWidget(self.status_label)
         self.setLayout(layout)
 
-        # Commanded world-frame position sent to the flight controller each tick.
-        self._pos = {'x': 0.0, 'y': 0.0, 'z': TAKEOFF_START_HEIGHT, 'yaw': 0.0}
-        # State estimator readout (updated by log callback at 50 Hz).
+        # Body-frame velocity + absolute-height command sent each tick.
+        #   x   -> forward velocity (m/s)
+        #   y   -> left velocity    (m/s)
+        #   yaw -> yaw rate         (deg/s)
+        #   height -> absolute z setpoint (m)
+        self.hover = {'x': 0.0, 'y': 0.0, 'yaw': 0.0, 'height': TAKEOFF_START_HEIGHT}
+        # State estimator readout (updated by log callback at 50 Hz) — for the map.
         self._est = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0}
-        # Full attitude quaternion (qx, qy, qz, qw) for the corner-ray gate
-        # projection; updated by a second log config. Identity until first sample.
-        self._quat = (0.0, 0.0, 0.0, 1.0)
         self._pos_lock = threading.Lock()
 
-        # Gate tracking in world frame.
-        self._gate_world = None   # (gx, gy, gz) locked estimate
-        self._traj       = []     # list of (x, y, z) waypoints
-        self._traj_idx   = 0
+        # Gate tracking — world estimate is for zone validation + the map ONLY,
+        # never for positioning the drone (positioning is purely visual).
+        self._gate_world = None        # (gx, gy, gz) last in-zone estimate
         self._last_est_gate = None     # last raw vision estimate (for the map)
         self._last_est_in_zone = None  # whether it passed the zone check
 
         # Simple autonomy state machine.
         self._gate_state = "WAIT"  # WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> SEARCH ...
-        self._push_target = (0.0, 0.0, TAKEOFF_START_HEIGHT)  # world point for PUSH state
         self._log_ready  = False
         self._state_t0 = time.monotonic()
         self._gates_passed = 0
         self._vision_lock = threading.Lock()
         self._vision = {"found": False, "ex": 0.0, "ey": 0.0, "bbox": None, "area": 0.0}
-        self._detections = []
 
         self._last_ctrl_time = time.monotonic()
 
@@ -586,37 +511,6 @@ class FPVWindow(QtWidgets.QWidget):
         color = _undistort_image(color)
 
         det = _detect_green_gate(color)
-
-        if det.get("found", False):
-            with self._pos_lock:
-                est = dict(self._est)
-            corners = det.get("corners", None)
-            if corners is not None:
-                corners = np.asarray(corners, dtype=float).reshape(-1, 2).tolist()
-            self._detections.append({
-                "t": time.time(),
-                "gate": {
-                    "ex": float(det.get("ex", 0.0)),
-                    "ey": float(det.get("ey", 0.0)),
-                    "bbox": det.get("bbox", None),
-                    "area": float(det.get("area", 0.0)),
-                    "cx": float(det.get("cx", 0.0)),
-                    "cy": float(det.get("cy", 0.0)),
-                    "corners": corners,
-                },
-                "drone": {
-                    "x": float(est.get("x", 0.0)),
-                    "y": float(est.get("y", 0.0)),
-                    "z": float(est.get("z", 0.0)),
-                    "yaw": float(est.get("yaw", 0.0)),
-                },
-            })
-            try:
-                with open(DETECTION_LOG_PATH, 'w', encoding='utf-8') as f:
-                    json.dump(self._detections, f, indent=2)
-            except Exception as e:
-                print(f"Failed to save gate detections: {e}")
-        
         with self._vision_lock:
             self._vision = {
                 "found": bool(det.get("found", False)),
@@ -696,99 +590,85 @@ class FPVWindow(QtWidgets.QWidget):
             return
 
         if not self._log_ready:
-            # Wait for the first Lighthouse position sample so the commanded
-            # position is seeded from the real estimate (not world-origin).
+            # Wait for the first Lighthouse position sample so the zone check and
+            # the map have a real world pose before we start flying.
             return
+
+        # Body-frame velocity commands computed this tick (height is a setpoint
+        # held in self.hover['height'] and only nudged).
+        x_cmd = 0.0
+        y_cmd = 0.0
+        yaw_cmd = 0.0
 
         if self._gate_state == "WAIT":
             self._gate_state = "TAKEOFF"
             self._state_t0   = now
 
         if self._gate_state == "TAKEOFF":
-            self._pos['z'] = float(min(self._pos['z'] + TAKEOFF_RATE * dt, SEARCH_HEIGHT))
-            if self._pos['z'] >= SEARCH_HEIGHT - 1e-3:
+            self.hover['height'] = float(
+                min(self.hover['height'] + TAKEOFF_RATE * dt, SEARCH_HEIGHT))
+            if self.hover['height'] >= SEARCH_HEIGHT - 1e-3:
                 self._gate_state = "SEARCH"
                 self._state_t0 = now
 
         elif self._gate_state == "SEARCH":
-            # Yaw in place; x/y/z hold their current commanded values.
-            self._pos['yaw'] += SEARCH_YAWRATE * dt
+            # Yaw in place; only lock on if the detection's world estimate snaps
+            # into the expected gate's zone (rejects stray bright blobs).
+            yaw_cmd = SEARCH_YAWRATE
             if found and bbox is not None:
-                gw = self._gate_to_world(corners)
+                gw = self._gate_to_world(ex, ey, bbox, corners)
                 gate_idx = self._gates_passed + 1
-                snapped = self._zone_map.validate_and_snap(gw, gate_idx) if gw is not None else None
-                if gw is not None:
-                    self._last_est_gate = gw
-                    self._last_est_in_zone = snapped is not None
-                # Only lock and chase if the estimate falls in the expected
-                # gate's zone; otherwise keep yawing (a stray bright blob).
+                self._last_est_gate = gw
+                snapped = self._zone_map.validate_and_snap(gw, gate_idx)
+                self._last_est_in_zone = snapped is not None
                 if snapped is not None:
                     self._gate_world = snapped
-                    self._traj     = self._build_traj(snapped)
-                    self._traj_idx = 0
                     self._gate_state = "CHASE"
                     self._state_t0 = now
 
         elif self._gate_state == "CHASE":
             if (now - self._state_t0) > CHASE_TIMEOUT:
-                # Missed the gate — give up and search again.
+                # Lost the gate for too long — give up and search again.
                 self._gate_world = None
-                self._traj       = []
-                self._traj_idx   = 0
                 self._gate_state = "SEARCH"
                 self._state_t0   = now
+            elif not found or bbox is None:
+                # Momentarily lost: hover and wait for re-detection / timeout.
+                pass
             else:
-                # Continuously refine gate world position while visible.
-                if found and bbox is not None:
-                    new_gw = self._gate_to_world(corners)
-                    gate_idx = self._gates_passed + 1
-                    snapped = self._zone_map.validate_and_snap(new_gw, gate_idx) if new_gw is not None else None
-                    if new_gw is not None:
-                        self._last_est_gate = new_gw
-                        self._last_est_in_zone = snapped is not None
-                    # Ignore refinements that drift out of the expected zone.
-                    if snapped is not None:
-                        ox, oy, oz = self._gate_world
-                        nx, ny, nz = snapped
-                        self._gate_world = (
-                            ox + GATE_EMA_ALPHA * (nx - ox),
-                            oy + GATE_EMA_ALPHA * (ny - oy),
-                            oz + GATE_EMA_ALPHA * (nz - oz),
-                        )
-                        if self._traj_idx == 0:
-                            self._traj = self._build_traj(self._gate_world)
+                # Keep validating against the zone for the map (display only).
+                gw = self._gate_to_world(ex, ey, bbox, corners)
+                gate_idx = self._gates_passed + 1
+                self._last_est_gate = gw
+                snapped = self._zone_map.validate_and_snap(gw, gate_idx)
+                self._last_est_in_zone = snapped is not None
+                if snapped is not None:
+                    self._gate_world = snapped
 
-                # Gate close enough (bbox fills a large fraction of the frame):
-                # commit to a straight push through it before searching again.
                 if area / img_area > PASS_AREA_FRAC:
-                    yaw_r = np.deg2rad(est['yaw'])
-                    push_dist = FORWARD_SPEED * PUSH_DURATION_S + TRAJ_OVERSHOOT
-                    self._push_target = (
-                        est['x'] + push_dist * np.cos(yaw_r),
-                        est['y'] + push_dist * np.sin(yaw_r),
-                        self._pos['z'],
-                    )
+                    # Gate fills the frame: commit to a straight push through it.
                     self._gate_state = "PUSH"
                     self._state_t0   = now
-                elif self._traj:
-                    # Command next waypoint; aim yaw toward locked gate.
-                    wp = self._traj[self._traj_idx]
-                    self._pos['x'], self._pos['y'], self._pos['z'] = wp
-                    gx, gy, _ = self._gate_world
-                    self._pos['yaw'] = float(np.degrees(
-                        np.arctan2(gy - est['y'], gx - est['x'])))
-                    dist_wp = np.hypot(est['x'] - wp[0], est['y'] - wp[1])
-                    if dist_wp < WAYPOINT_TOL and self._traj_idx < len(self._traj) - 1:
-                        self._traj_idx += 1
+                else:
+                    # --- Purely visual servo toward the gate ---
+                    # Yaw to centre the gate horizontally.
+                    yaw_cmd = float(np.clip(-K_YAW * ex, -MAX_YAWRATE, MAX_YAWRATE))
+                    # Small lateral nudge to help recentre (kept small).
+                    y_cmd = float(np.clip(-K_LATERAL * ex, -MAX_LATERAL, MAX_LATERAL))
+                    # Height: ey > 0 means gate below image centre -> descend.
+                    dh = float(np.clip(-K_HEIGHT * ey, -MAX_DH_PER_S, MAX_DH_PER_S))
+                    self.hover['height'] = float(
+                        np.clip(self.hover['height'] + dh * dt, MIN_HEIGHT, MAX_HEIGHT))
+                    # Creep forward, slowing down the more off-centre the gate is.
+                    align = max(0.0, 1.0 - abs(ex) / ALIGN_FALLOFF)
+                    x_cmd = CHASE_FORWARD * align
 
         elif self._gate_state == "PUSH":
-            # Drive straight to the overshoot point (yaw held), then reset to SEARCH.
-            self._pos['x'], self._pos['y'], self._pos['z'] = self._push_target
+            # Drive straight forward (yaw held) to clear the gate, then reset.
+            x_cmd = FORWARD_SPEED
             if (now - self._state_t0) >= PUSH_DURATION_S:
                 self._gates_passed += 1
                 self._gate_world = None
-                self._traj       = []
-                self._traj_idx   = 0
                 if self._gates_passed >= MAX_GATES:
                     self._gate_state = "DONE"
                     self.cf.commander.send_stop_setpoint()
@@ -797,22 +677,20 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gate_state = "SEARCH"
                 self._state_t0   = now
 
-        self._pos['z'] = float(np.clip(self._pos['z'], MIN_HEIGHT, MAX_HEIGHT))
-        #self.cf.commander.send_position_setpoint(
-        #    self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'])
+        # Apply the computed body-frame command + height setpoint.
+        self.hover['x'] = x_cmd
+        self.hover['y'] = y_cmd
+        self.hover['yaw'] = yaw_cmd
+        self.hover['height'] = float(np.clip(self.hover['height'], MIN_HEIGHT, MAX_HEIGHT))
+        self.cf.commander.send_hover_setpoint(
+            self.hover['x'], self.hover['y'], self.hover['yaw'], self.hover['height'])
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat():
             return
         k = event.key()
-        if k == QtCore.Qt.Key.Key_Up:    self._pos['x'] += 0.2
-        if k == QtCore.Qt.Key.Key_Down:  self._pos['x'] -= 0.2
-        if k == QtCore.Qt.Key.Key_Left:  self._pos['y'] += 0.2
-        if k == QtCore.Qt.Key.Key_Right: self._pos['y'] -= 0.2
-        if k == QtCore.Qt.Key.Key_W:     self._pos['z'] += 0.1
-        if k == QtCore.Qt.Key.Key_S:     self._pos['z'] -= 0.1
-        if k == QtCore.Qt.Key.Key_A:     self._pos['yaw'] -= 15.0
-        if k == QtCore.Qt.Key.Key_D:     self._pos['yaw'] += 15.0
+        if k == QtCore.Qt.Key.Key_W:     self.hover['height'] += 0.1
+        if k == QtCore.Qt.Key.Key_S:     self.hover['height'] -= 0.1
         if k == QtCore.Qt.Key.Key_Escape:
             # Safety: abort autonomy and brake to zero velocity (keep hovering).
             self._gate_state = "STOP"
@@ -839,33 +717,6 @@ class FPVWindow(QtWidgets.QWidget):
         self._log_cfg = lc
         print('StateEst log started — waiting for first Lighthouse position…')
 
-        # Second config: full attitude quaternion for the gate corner-ray
-        # projection. Kept separate so neither config exceeds the log packet
-        # size limit (StateEst already carries 4 floats).
-        qc = LogConfig('Quat', period_in_ms=20)
-        qc.add_variable('stateEstimate.qx', 'float')
-        qc.add_variable('stateEstimate.qy', 'float')
-        qc.add_variable('stateEstimate.qz', 'float')
-        qc.add_variable('stateEstimate.qw', 'float')
-        try:
-            self.cf.log.add_config(qc)
-        except Exception as e:
-            print(f'Could not add Quat log config: {e}')
-        else:
-            qc.data_received_cb.add_callback(self._on_log_quat)
-            qc.error_cb.add_callback(lambda _conf, msg: print('Quat log error:', msg))
-            qc.start()
-            self._log_quat_cfg = qc
-
-    def _on_log_quat(self, _ts, data, _lc):
-        with self._pos_lock:
-            self._quat = (
-                data['stateEstimate.qx'],
-                data['stateEstimate.qy'],
-                data['stateEstimate.qz'],
-                data['stateEstimate.qw'],
-            )
-
     def _on_log(self, _ts, data, _lc):
         with self._pos_lock:
             self._est['x']   = data['stateEstimate.x']
@@ -873,13 +724,9 @@ class FPVWindow(QtWidgets.QWidget):
             self._est['z']   = data['stateEstimate.z']
             self._est['yaw'] = data['stabilizer.yaw']
             if not self._log_ready:
-                # Seed commanded position from the first Lighthouse estimate so
-                # the drone holds its current position rather than jumping to
-                # world-origin, then takeoff can begin immediately.
-                self._pos['x']   = self._est['x']
-                self._pos['y']   = self._est['y']
-                self._pos['z']   = self._est['z']
-                self._pos['yaw'] = self._est['yaw']
+                # Seed the commanded height from the first Lighthouse estimate so
+                # takeoff ramps from the drone's real altitude, then begin.
+                self.hover['height'] = float(np.clip(self._est['z'], MIN_HEIGHT, MAX_HEIGHT))
                 self._log_ready  = True
                 print(
                     f"First Lighthouse position: x={self._est['x']:.2f} "
@@ -887,79 +734,57 @@ class FPVWindow(QtWidgets.QWidget):
                     f"yaw={self._est['yaw']:.1f} — leaving WAIT"
                 )
 
-    def _gate_to_world(self, corners):
-        """Project the four gate corners to a world-frame gate centre.
+    def _gate_to_world(self, ex, ey, bbox, corners=None):
+        """Project a gate detection to a world-frame point.
 
-        Each corner is back-projected to a viewing ray (calibrated intrinsics),
-        rotated into the world with the drone's full attitude quaternion (so
-        camera pitch/roll are handled, not just yaw), and metric depth is
-        recovered by enforcing that each vertical gate edge is a vertical
-        segment of length GATE_PHYS_H. Returns the (gx, gy, gz) mean of the four
-        world corners, or None if the gate is clipped by the frame or the
-        geometry does not solve cleanly. Ported from
-        petr_assignment.Surveyer.pixels_to_world.
+        Used ONLY for the zone validation/snap and the top-down map — the drone
+        is never commanded toward this point. Depth comes from the gate's *pixel
+        height*: a yaw off head-on foreshortens the gate's width but not its
+        height, so height is the stable ranging dimension. Pinhole:
+        Z = fy * GATE_PHYS_H / h_px. The lateral/vertical offset is the
+        calibrated back-projection of the gate centroid at that depth. Falls
+        back to the bbox-height pinhole when the corners are unavailable.
         """
-        if corners is None:
-            return None
-        c = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
-        if c.shape[0] != 4:
-            return None
-        # A clipped gate's corners no longer mark the real opening -> bad scale.
-        if not _gate_fully_in_frame(c, IMG_WIDTH, IMG_HEIGHT):
-            return None
+        h_px = _gate_pixel_height(corners)
+        if h_px is not None:
+            dist = max(CAMERA_FY * GATE_PHYS_H / h_px, 0.3)
+            src = "height"
+        else:
+            # Fallback (no corners): use the bbox HEIGHT, not width — gate width
+            # varies between gates and foreshortens, but height is fixed/known.
+            bh = bbox[3]
+            dist = max(CAMERA_FY * GATE_PHYS_H / max(bh, 1), 0.3)
+            src = "bbox-h"
+
+        # Direction from the gate centroid offset, back-projected at `dist`.
+        # Body frame: x forward, y left, z up (camera looks along +body_x).
+        x_err_px = ex * max(0.5 * IMG_WIDTH, 1.0)
+        y_err_px = ey * max(0.5 * IMG_HEIGHT, 1.0)
+        dx_b =  dist
+        dy_b = -x_err_px * dist / CAMERA_FX
+        dz_b = -y_err_px * dist / CAMERA_FY
 
         with self._pos_lock:
-            cam_pos = np.array(
-                [self._est['x'], self._est['y'], self._est['z']], dtype=np.float64)
-            quat = self._quat
-            yaw_dbg = self._est['yaw']
-        rot = _quat_to_rot(*quat)  # body -> world
-
-        # Viewing rays for TL, TR, BR, BL in the world frame.
-        rays = []
-        for (u, v) in c:
-            rw = rot @ _pixel_ray_body(u, v)
-            rays.append(rw / np.linalg.norm(rw))
-        r_tl, r_tr, r_br, r_bl = rays
-
-        # Solve each vertical edge (left: TL-BL, right: TR-BR) for metric depth.
-        left = _solve_vertical_pair(r_tl, r_bl, cam_pos, GATE_PHYS_H)
-        right = _solve_vertical_pair(r_tr, r_br, cam_pos, GATE_PHYS_H)
-        if left is None or right is None:
-            return None
-        p_tl, p_bl = left
-        p_tr, p_br = right
-        world_corners = np.array([p_tl, p_tr, p_br, p_bl], dtype=np.float64)
-
-        gx, gy, gz = world_corners.mean(axis=0)
-        gz = float(np.clip(gz, MIN_HEIGHT, MAX_HEIGHT))
+            yaw_r = np.deg2rad(self._est['yaw'])
+            ox, oy, oz = self._est['x'], self._est['y'], self._est['z']
+        gx = ox + dx_b * np.cos(yaw_r) - dy_b * np.sin(yaw_r)
+        gy = oy + dx_b * np.sin(yaw_r) + dy_b * np.cos(yaw_r)
+        gz = float(np.clip(oz + dz_b, MIN_HEIGHT, MAX_HEIGHT))
 
         if DEBUG_GATE_POSE:
-            gate_left = 0.5 * (p_tl + p_bl)
-            gate_right = 0.5 * (p_tr + p_br)
-            ang = float(np.degrees(np.arctan2(
-                gate_right[1] - gate_left[1], gate_right[0] - gate_left[0])))
-            rng = float(np.linalg.norm(world_corners.mean(axis=0) - cam_pos))
+            rng = float(np.sqrt(dx_b**2 + dy_b**2 + dz_b**2))
+            bw_px = bh_px = -1.0
+            if corners is not None:
+                c = np.asarray(corners, np.float64).reshape(-1, 2)
+                bw_px = float(c[:, 0].max() - c[:, 0].min())
+                bh_px = float(c[:, 1].max() - c[:, 1].min())
             print(
-                f"[gate ray] range={rng:.2f}m angle={ang:+.0f} | "
-                f"drone(x={cam_pos[0]:.2f} y={cam_pos[1]:.2f} z={cam_pos[2]:.2f} "
-                f"yaw={yaw_dbg:.0f}) -> gate(x={gx:.2f} y={gy:.2f} z={gz:.2f})"
+                f"[gate {src}] px(w={bw_px:.0f} h={bh_px:.0f}) "
+                f"body(fwd={dx_b:+.2f} left={dy_b:+.2f} up={dz_b:+.2f}) "
+                f"range={rng:.2f}m | drone(x={ox:.2f} y={oy:.2f} z={oz:.2f} "
+                f"yaw={np.degrees(yaw_r):.0f}) -> gate(x={gx:.2f} y={gy:.2f} z={gz:.2f})"
             )
-        return float(gx), float(gy), gz
-
-    def _build_traj(self, gate):
-        """Linear trajectory from current drone position to gate + overshoot."""
-        with self._pos_lock:
-            x0, y0, z0 = self._est['x'], self._est['y'], self._est['z']
-        gx, gy, gz = gate
-        dx, dy = gx - x0, gy - y0
-        mag = np.hypot(dx, dy) + 1e-6
-        end_x = gx + TRAJ_OVERSHOOT * dx / mag
-        end_y = gy + TRAJ_OVERSHOOT * dy / mag
-        ts = np.linspace(0.0, 1.0, TRAJ_N_STEPS + 1)[1:]
-        return [(x0 + (end_x - x0) * t,
-                 y0 + (end_y - y0) * t,
-                 z0 + (gz    - z0) * t) for t in ts]
+        return gx, gy, gz
 
     def _set_status(self, text):
         """Thread-safe status label update."""
@@ -970,8 +795,7 @@ class FPVWindow(QtWidgets.QWidget):
 
     def _connected(self, uri):
         # No Kalman reset: the Lighthouse already provides an absolute, converged
-        # position estimate. Resetting would discard it and force a reconvergence
-        # wait. Just start logging and take off using the current estimate.
+        # position estimate. Just start logging and take off.
         self._set_status(f'Connected to {uri}')
         self._setup_log()
 
@@ -983,17 +807,6 @@ class FPVWindow(QtWidgets.QWidget):
         self._timer.stop()
         if hasattr(self, '_log_cfg'):
             self._log_cfg.stop()
-<<<<<<< HEAD
-        try:
-            with open(DETECTION_LOG_PATH, 'w', encoding='utf-8') as f:
-                json.dump(self._detections, f, indent=2)
-            print(f"Saved gate detections to {DETECTION_LOG_PATH}")
-        except Exception as e:
-            print(f"Failed to save gate detections: {e}")
-=======
-        if hasattr(self, '_log_quat_cfg'):
-            self._log_quat_cfg.stop()
->>>>>>> 1c2390c0bbc1249fcf8ab5a27673af71af4a9ff5
         self.cf.commander.send_stop_setpoint()
         self.cf.close_link()
 
