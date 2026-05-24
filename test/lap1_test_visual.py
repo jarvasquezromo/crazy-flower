@@ -182,9 +182,10 @@ CHASE_RECOVER_Z_PHASE_S = 1.0 # seconds per up/down/back height phase
 CHASE_RECOVER_YAWRATE = 10.0 # deg/s; small right/left turn after height scan
 CHASE_RECOVER_YAW_PHASE_S = 0.8 # seconds per right/left yaw phase
 
-# --- Centred-approach / pass-through gating ---
+# --- Centred-approach / pass-throg gh gating ---
 APPROACH_TOL_X = 0.05        # normalized |ex| to count as "centred" before creeping forward
 APPROACH_TOL_Y = 0.10        # normalized |ey| to count as "centred"
+APPROACH_TARGET_EY = 0.06    # positive: hold gate below image centre -> fly slightly higher
 PASS_CONFIRM_FRAMES = 5      # consecutive big-and-centred frames before committing to PUSH
 PASS_THROUGH_DIST = 1.2      # meters of forward travel in PUSH (distance-based, not time)
 PUSH_MAX_DURATION = 10.0     # seconds, PUSH safety timeout if travel never reached
@@ -824,7 +825,10 @@ class FPVWindow(QtWidgets.QWidget):
                     # --- Servo yaw + height to centre the TARGET gate ---
                     yaw_cmd = float(np.clip(-K_YAW * ex_t, -MAX_YAWRATE, MAX_YAWRATE))
                     y_cmd = float(np.clip(-K_LATERAL * ex_t, -MAX_LATERAL, MAX_LATERAL))
-                    # Height: ey > 0 means gate below image centre -> descend.
+                    # Height: ey > 0 means gate below image centre. We target a
+                    # small positive offset so the drone flies slightly higher
+                    # than pure image-centre alignment.
+                    ey_err = ey_t - APPROACH_TARGET_EY
                     # Close to the gate, centre estimates get noisy because the
                     # gate occupies many pixels; reduce z corrections there.
                     slowdown_span = max(PASS_AREA_FRAC - HEIGHT_SLOWDOWN_AREA_FRAC, 1e-6)
@@ -835,11 +839,11 @@ class FPVWindow(QtWidgets.QWidget):
                     ))
                     height_scale = 1.0 - slowdown * (1.0 - HEIGHT_MIN_SCALE)
                     max_dh = MAX_DH_PER_S * height_scale
-                    dh = float(np.clip(-K_HEIGHT * height_scale * ey_t, -max_dh, max_dh))
+                    dh = float(np.clip(-K_HEIGHT * height_scale * ey_err, -max_dh, max_dh))
                     self.hover['height'] = float(
                         np.clip(self.hover['height'] + dh * dt, MIN_HEIGHT, MAX_HEIGHT))
 
-                    centred = (abs(ex_t) <= APPROACH_TOL_X) and (abs(ey_t) <= APPROACH_TOL_Y)
+                    centred = (abs(ex_t) <= APPROACH_TOL_X) and (abs(ey_err) <= APPROACH_TOL_Y)
 
                     # Commit to PUSH only after the gate is BIG and CENTRED for a
                     # few consecutive frames (robust against one-off area spikes).
