@@ -8,9 +8,11 @@ validated frame-by-frame without flying.
 Detection (shared with lap1_test.py)
   - Threshold bright pixels into a mask, morphologically close it.
   - Validate each contour as a gate-shaped polygon (approxPolyDP vertex count,
-    aspect ratio, solidity); the centre is the polygon's area centroid.
+    aspect ratio, solidity); the centre is the polygon's area centroid and the
+    four corners are ordered TL/TR/BR/BL for height ranging.
   - Keep all candidates, select the rightmost; project it to a world point via
-    a pinhole model (gate_to_world) using the (simulated) drone pose.
+    a pinhole model (gate_to_world) whose depth comes from the gate's pixel
+    *height* (corners, bbox-height fallback) using the (simulated) drone pose.
 
 State machine (mirrors lap1_test.py, simulated offline)
   WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> (repeat) -> DONE
@@ -43,7 +45,8 @@ TARGET_W = 324
 TARGET_H = 244
 PROCESS_FPS = 2.0
 
-GATE_PHYS_W  = 0.8               # metres, physical gate width
+GATE_PHYS_H  = 0.4             # metres, physical gate height — the stable ranging
+                               # dimension (yaw foreshortens width, not height)
 CAMERA_FOV_H = np.deg2rad(87.0)  # AI-deck color camera H FoV (datasheet); overridden by calib file
 
 # --- Control / state-machine tuning (mirrors lap1_test.py) ---
@@ -86,21 +89,21 @@ def load_calibration(path):
 
 
 def gate_to_world(ex, ey, bbox, drone_z, drone_yaw_deg, calib,
-                  drone_x=0.0, drone_y=0.0):
+                  drone_x=0.0, drone_y=0.0, corners=None):
     """Project detected gate centre (image coords) to world frame.
 
     Assumes camera looks along body +X (forward-facing AI-deck).
-    ex, ey are normalised to [-1, 1] from the image centre.
+    ex, ey are normalised to [-1, 1] from the image centre. Depth comes from
+    the gate's pixel *height* (see gate_distance), mirroring lap1_test.py.
     Returns (gx, gy, gz) in metres, relative to Lighthouse origin.
     """
-    bw = bbox[2]
     fx = calib['fx']
     fy = calib.get('fy', fx)
     # Principal-point offset correction (normalised, 0 if calibration is centred)
     cx_off = (calib.get('cx', TARGET_W / 2.0) - TARGET_W / 2.0) / max(TARGET_W / 2.0, 1.0)
     cy_off = (calib.get('cy', TARGET_H / 2.0) - TARGET_H / 2.0) / max(TARGET_H / 2.0, 1.0)
-    # Distance from gate bbox width: dist = (phys_width * focal_px) / bbox_px
-    dist   = max(GATE_PHYS_W * fx / max(bw, 1), 0.3)
+    # Distance from gate pixel height (corners), bbox-height fallback.
+    dist   = gate_distance(bbox, corners, calib)
     # Body-frame offsets (pinhole: angle = pixel_offset / focal_length)
     dx_b   =  dist
     dy_b   = -(ex - cx_off) * (TARGET_W / 2.0) / fx * dist
@@ -111,6 +114,102 @@ def gate_to_world(ex, ey, bbox, drone_z, drone_yaw_deg, calib,
     gy = drone_y + dx_b * np.sin(yaw_r) + dy_b * np.cos(yaw_r)
     gz = drone_z + dz_b
     return gx, gy, gz
+
+
+def _order_corners(pts):
+    """Order 4 image points as [TL, TR, BR, BL] (image y increases downward)."""
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    s = pts[:, 0] + pts[:, 1]
+    d = pts[:, 0] - pts[:, 1]
+    return np.array([
+        pts[np.argmin(s)],   # TL
+        pts[np.argmax(d)],   # TR
+        pts[np.argmax(s)],   # BR
+        pts[np.argmin(d)],   # BL
+    ], dtype=np.float64)
+
+
+def _quad_corners(cnt, approx):
+    """Best 4-corner estimate of the gate quad, ordered TL/TR/BR/BL.
+
+    Uses the polygon approximation directly when it is a clean quad (keeps the
+    true perspective of the four corners); otherwise falls back to the rotated
+    min-area rectangle around the contour. Returns None if the 4 corners are not
+    distinct. Mirrors lap1_test.py._quad_corners.
+    """
+    if len(approx) == 4:
+        pts = approx.reshape(-1, 2).astype(np.float64)
+    else:
+        pts = cv2.boxPoints(cv2.minAreaRect(cnt)).astype(np.float64)
+    ordered = _order_corners(pts)
+    if len(np.unique(np.round(ordered, 1), axis=0)) != 4:
+        return None
+    return ordered
+
+
+def _gate_pixel_height(corners):
+    """Vertical pixel extent of the gate from its two side edges (TL-BL, TR-BR).
+
+    Uses the side edges (not the bbox) so it stays correct under tilt, and uses
+    height rather than width because a yaw off head-on foreshortens the gate's
+    width but leaves its height intact. Returns None if unusable. Mirrors
+    lap1_test.py._gate_pixel_height.
+    """
+    if corners is None:
+        return None
+    c = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+    if c.shape[0] != 4:
+        return None
+    tl, tr, br, bl = c
+    left_h  = float(np.linalg.norm(bl - tl))
+    right_h = float(np.linalg.norm(br - tr))
+    h_px = 0.5 * (left_h + right_h)
+    return h_px if h_px > 1.0 else None
+
+
+def gate_distance(bbox, corners, calib):
+    """Camera->gate distance (m) from the gate's pixel height.
+
+    Pinhole: dist = fy * GATE_PHYS_H / h_px, using the corner-derived side-edge
+    height when available and the bbox height as a fallback. Height is the
+    stable ranging dimension (mirrors lap1_test.py._gate_to_world).
+    """
+    fy = calib.get('fy', calib['fx'])
+    h_px = _gate_pixel_height(corners)
+    if h_px is None:
+        h_px = max(bbox[3], 1)   # bbox-height fallback
+    return max(fy * GATE_PHYS_H / h_px, 0.3)
+
+
+def gate_edge_world_sizes(corners, bbox, calib):
+    """World-frame lengths (m) of the 4 detected gate edges.
+
+    Depth comes from gate_distance (gate pixel height). A pixel displacement
+    (du, dv) on a fronto-parallel plane at that depth spans (du*dist/fx,
+    dv*dist/fy) metres, so each polygon edge's world length is the norm of that.
+    Returns a dict with the four edges (top/right/bottom/left), their mean
+    width/height and depth, or None when the corners are unavailable.
+    """
+    if corners is None:
+        return None
+    fx = calib['fx']
+    fy = calib.get('fy', fx)
+    dist = gate_distance(bbox, corners, calib)
+    tl, tr, br, bl = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+
+    def world_len(a, b):
+        du = (b[0] - a[0]) * dist / fx
+        dv = (b[1] - a[1]) * dist / fy
+        return float(np.hypot(du, dv))
+
+    top, right, bottom, left = (world_len(tl, tr), world_len(tr, br),
+                                world_len(br, bl), world_len(bl, tl))
+    return {
+        "top": top, "right": right, "bottom": bottom, "left": left,
+        "width": 0.5 * (top + bottom),    # horizontal edges
+        "height": 0.5 * (left + right),   # vertical edges
+        "dist": dist,
+    }
 
 
 class VideoFrameStore:
@@ -234,10 +333,11 @@ def _gate_candidate(cnt, img_w, img_h, min_area_frac):
         "aspect": float(aspect),
         "solidity": float(solidity),
         "approx": approx,
+        "corners": _quad_corners(cnt, approx),  # ordered TL/TR/BR/BL for height ranging
     }
 
 
-def detect_green_gate(rgb_img, hsv_lo, hsv_hi, min_v, min_area_frac, kernel_size=3, *, use_bw=False):
+def detect_green_gate(rgb_img, hsv_lo, hsv_hi, min_v, min_area_frac, kernel_size=5, *, use_bw=False):
     """Detect gate(s) and return (detection_dict, mask).
 
     The detection dict describes the *selected* gate (the rightmost one when
@@ -304,11 +404,12 @@ class GateController:
         self.t = 0.0
         self.state_t0 = 0.0
 
-    def _gate_to_world(self, ex, ey, bbox):
+    def _gate_to_world(self, ex, ey, bbox, corners=None):
         return gate_to_world(
             ex, ey, bbox,
             self.est["z"], self.est["yaw"], self.calib,
             drone_x=self.est["x"], drone_y=self.est["y"],
+            corners=corners,
         )
 
     def _build_traj(self, gate):
@@ -345,6 +446,7 @@ class GateController:
         ex = float(det.get("ex", 0.0))
         ey = float(det.get("ey", 0.0))
         bbox = det.get("bbox", None)
+        corners = det.get("corners", None)
         area = float(det.get("area", 0.0))
 
         if self.state == "WAIT":
@@ -360,7 +462,7 @@ class GateController:
         elif self.state == "SEARCH":
             self.pos["yaw"] += search_yawrate * dt
             if found and bbox is not None:
-                gw = self._gate_to_world(ex, ey, bbox)
+                gw = self._gate_to_world(ex, ey, bbox, corners)
                 self.gate_world = gw
                 self.traj = self._build_traj(gw)
                 self.traj_idx = 0
@@ -376,7 +478,7 @@ class GateController:
                 self.state_t0 = now
             else:
                 if found and bbox is not None:
-                    nx, ny, nz = self._gate_to_world(ex, ey, bbox)
+                    nx, ny, nz = self._gate_to_world(ex, ey, bbox, corners)
                     ox, oy, oz = self.gate_world
                     self.gate_world = (
                         ox + GATE_EMA_ALPHA * (nx - ox),
@@ -453,7 +555,7 @@ def main():
         "v_lo": 50,
         "min_v": 240,
         "min_area_frac": 0.01,
-        "kernel": 3,
+        "kernel": 5,
         "search_yawrate": SEARCH_YAWRATE,
         "search_height": SEARCH_HEIGHT,
         "pass_area_frac": PASS_AREA_FRAC,
@@ -509,6 +611,20 @@ def main():
         if det.get("found", False) and sel_bbox is not None:
             cv2.circle(overlay, (int(round(det["cx"])), int(round(det["cy"]))), 4, (255, 0, 0), -1)
 
+            # World-frame size of the detected gate polygon's edges.
+            corners = det.get("corners")
+            edges = gate_edge_world_sizes(corners, sel_bbox, calib)
+            if edges is not None:
+                det["edge_world"] = edges
+                pts = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+                labels = ("top", "right", "bottom", "left")
+                for i, name in enumerate(labels):
+                    a = pts[i]
+                    b = pts[(i + 1) % 4]
+                    mx, my = int(round(0.5 * (a[0] + b[0]))), int(round(0.5 * (a[1] + b[1])))
+                    cv2.putText(overlay, f"{edges[name]:.2f}m", (mx - 18, my),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+
         return overlay, mask, det
 
     overlay0, mask0, det0 = compute_panels(frame0)
@@ -521,6 +637,8 @@ def main():
 
     title = fig.suptitle("", fontsize=12)
 
+    last_print_idx = [-1]   # avoid re-printing the same frame on slider redraws
+
     def refresh():
         nonlocal idx, playing
         frame = store.get(idx)
@@ -529,6 +647,17 @@ def main():
         found = bool(det.get("found", False))
         ex = float(det.get("ex", 0.0))
         ey = float(det.get("ey", 0.0))
+
+        # Print the world-frame size of the detected gate polygon's edges.
+        edges = det.get("edge_world")
+        if edges is not None and (playing or idx != last_print_idx[0]):
+            print(
+                f"[frame {idx + 1:04d}] gate edges (world): "
+                f"top={edges['top']:.2f} right={edges['right']:.2f} "
+                f"bottom={edges['bottom']:.2f} left={edges['left']:.2f} m  "
+                f"(W={edges['width']:.2f} H={edges['height']:.2f} m @ dist={edges['dist']:.2f} m)"
+            )
+            last_print_idx[0] = idx
 
         # Advance the state machine only while playing (dt=0 when paused/scrubbing).
         dt = (1.0 / fps) if playing else 0.0
