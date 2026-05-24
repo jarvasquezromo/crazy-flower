@@ -177,6 +177,10 @@ ALIGN_FALLOFF = 0.60         # |ex| at which forward creep is fully suppressed (
 CHASE_RETURN_K = 0.6         # proportional velocity gain back to last good CHASE pose
 CHASE_RETURN_MAX_SPEED = 0.12  # m/s clamp when returning after losing the gate
 CHASE_RETURN_TOL = 0.05      # m; stop once back at the last good CHASE pose
+CHASE_RECOVER_Z_DELTA = 0.12 # m; vertical scan after CHASE timeout, go above and under this distance
+CHASE_RECOVER_Z_PHASE_S = 1.0 # seconds per up/down/back height phase
+CHASE_RECOVER_YAWRATE = 10.0 # deg/s; small right/left turn after height scan
+CHASE_RECOVER_YAW_PHASE_S = 0.8 # seconds per right/left yaw phase
 
 # --- Centred-approach / pass-through gating ---
 APPROACH_TOL_X = 0.05        # normalized |ex| to count as "centred" before creeping forward
@@ -560,6 +564,7 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_chase_gate_pose = None  # drone pose where target gate was last visible in CHASE
         self._chase_best_area_frac = 0.0
         self._chase_area_stall = 0
+        self._recover_height = TAKEOFF_HEIGHT
 
         # Simple autonomy state machine.
         self._gate_state = "WAIT"  # WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> SEARCH ...
@@ -758,13 +763,15 @@ class FPVWindow(QtWidgets.QWidget):
 
         elif self._gate_state == "CHASE":
             if (now - self._state_t0) > CHASE_TIMEOUT:
-                # Lost the gate for too long — give up and search again.
+                # Lost the gate for too long: do a small local recovery scan
+                # before falling back to the wider SEARCH yaw sweep.
                 self._gate_world = None
                 self._push_confirm = 0
                 self._last_chase_gate_pose = None
                 self._chase_best_area_frac = 0.0
                 self._chase_area_stall = 0
-                self._gate_state = "SEARCH"
+                self._recover_height = self.hover['height']
+                self._gate_state = "CHASE_RECOVER"
                 self._state_t0   = now
             elif not found or bbox is None:
                 # Momentarily lost: return to the last pose where the current
@@ -865,6 +872,44 @@ class FPVWindow(QtWidgets.QWidget):
                     else:
                         # Not centred: hold and keep rotating/raising to centre.
                         x_cmd = 0.0
+
+        elif self._gate_state == "CHASE_RECOVER":
+            gate_idx = self._gates_passed + 1
+            sel = self._select_target_candidate(candidates, gate_idx) if found else None
+            if sel is not None:
+                _cand, snapped = sel
+                self._gate_world = snapped
+                self._last_est_gate = snapped
+                self._last_est_in_zone = True
+                self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
+                self._chase_best_area_frac = 0.0
+                self._chase_area_stall = 0
+                self._gate_state = "CHASE"
+                self._state_t0 = now
+            else:
+                # Scan up, down, back to original height, then yaw right/left.
+                t = now - self._state_t0
+                z_phase = CHASE_RECOVER_Z_PHASE_S
+                yaw_phase = CHASE_RECOVER_YAW_PHASE_S
+                if t < z_phase:
+                    target_h = self._recover_height + CHASE_RECOVER_Z_DELTA
+                elif t < 3.0 * z_phase:
+                    target_h = self._recover_height - CHASE_RECOVER_Z_DELTA
+                else:
+                    target_h = self._recover_height
+                target_h = float(np.clip(target_h, MIN_HEIGHT, MAX_HEIGHT))
+                dh = float(np.clip(target_h - self.hover['height'], -MAX_DH_PER_S * dt, MAX_DH_PER_S * dt))
+                self.hover['height'] = float(np.clip(self.hover['height'] + dh, MIN_HEIGHT, MAX_HEIGHT))
+
+                if t >= 3.0 * z_phase:
+                    yaw_t = t - 3.0 * z_phase
+                    if yaw_t < yaw_phase:
+                        yaw_cmd = CHASE_RECOVER_YAWRATE
+                    elif yaw_t < 3.0 * yaw_phase:
+                        yaw_cmd = -CHASE_RECOVER_YAWRATE
+                    else:
+                        self._gate_state = "SEARCH"
+                        self._state_t0 = now
 
         elif self._gate_state == "PUSH":
             # Drive straight forward (yaw held) until we have travelled
