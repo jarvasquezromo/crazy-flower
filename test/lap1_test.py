@@ -74,6 +74,8 @@ from PyQt6 import QtCore, QtWidgets, QtGui
 import cv2
 import time
 
+from gate_map import GateZoneMap, GateMapWidget
+
 logging.basicConfig(level=logging.ERROR)
 
 warnings.filterwarnings('ignore', message='.*TYPE_HOVER_LEGACY.*')
@@ -203,7 +205,7 @@ GATE_APPROX_EPS   = 0.04   # approxPolyDP epsilon, fraction of perimeter
 
 # --- Camera / world-frame projection ---
 DEBUG_GATE_POSE = True               # print per-stage gate pose values for debugging
-GATE_PHYS_H    = 0.8                 # metres, physical gate height — the only fixed dimension
+GATE_PHYS_H    = 0.4                 # metres, physical gate height — the only fixed dimension
                                      # (gate width varies between gates and foreshortens with yaw);
                                      # depth is derived from this height alone
 TRAJ_N_STEPS   = 5                   # number of waypoints in interpolated trajectory
@@ -453,8 +455,16 @@ class FPVWindow(QtWidgets.QWidget):
         self.image_label = QtWidgets.QLabel()
         self.status_label = QtWidgets.QLabel('Connecting...')
 
+        # Course zone map (ground-truth gates from gates_xyz.py) + top-down view.
+        self._zone_map = GateZoneMap()
+        self.gate_map = GateMapWidget(self._zone_map)
+
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(self.image_label)
+        top.addWidget(self.gate_map, 1)
+
         layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.image_label)
+        layout.addLayout(top)
         layout.addWidget(self.status_label)
         self.setLayout(layout)
 
@@ -468,6 +478,8 @@ class FPVWindow(QtWidgets.QWidget):
         self._gate_world = None   # (gx, gy, gz) locked estimate
         self._traj       = []     # list of (x, y, z) waypoints
         self._traj_idx   = 0
+        self._last_est_gate = None     # last raw vision estimate (for the map)
+        self._last_est_in_zone = None  # whether it passed the zone check
 
         # Simple autonomy state machine.
         self._gate_state = "WAIT"  # WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> SEARCH ...
@@ -604,6 +616,16 @@ class FPVWindow(QtWidgets.QWidget):
         with self._pos_lock:
             est = dict(self._est)
 
+        # Refresh the top-down map: drone pose, current estimate, target gate.
+        target_gate = min(self._gates_passed + 1, MAX_GATES)
+        disp_gate = self._gate_world if self._gate_world is not None else self._last_est_gate
+        self.gate_map.update_state(
+            drone=(est['x'], est['y'], est['yaw']),
+            est_gate=disp_gate,
+            target_gate=target_gate,
+            est_in_zone=self._last_est_in_zone,
+        )
+
         img_area = float(IMG_WIDTH * IMG_HEIGHT)
 
         if self._gate_state == "DONE":
@@ -629,11 +651,18 @@ class FPVWindow(QtWidgets.QWidget):
             self._pos['yaw'] += SEARCH_YAWRATE * dt
             if found and bbox is not None:
                 gw = self._gate_to_world(ex, ey, bbox, corners)
-                self._gate_world = gw
-                self._traj     = self._build_traj(gw)
-                self._traj_idx = 0
-                self._gate_state = "CHASE"
-                self._state_t0 = now
+                gate_idx = self._gates_passed + 1
+                self._last_est_gate = gw
+                snapped = self._zone_map.validate_and_snap(gw, gate_idx)
+                self._last_est_in_zone = snapped is not None
+                # Only lock and chase if the estimate falls in the expected
+                # gate's zone; otherwise keep yawing (a stray bright blob).
+                if snapped is not None:
+                    self._gate_world = snapped
+                    self._traj     = self._build_traj(snapped)
+                    self._traj_idx = 0
+                    self._gate_state = "CHASE"
+                    self._state_t0 = now
 
         elif self._gate_state == "CHASE":
             if (now - self._state_t0) > CHASE_TIMEOUT:
@@ -647,15 +676,21 @@ class FPVWindow(QtWidgets.QWidget):
                 # Continuously refine gate world position while visible.
                 if found and bbox is not None:
                     new_gw = self._gate_to_world(ex, ey, bbox, corners)
-                    ox, oy, oz = self._gate_world
-                    nx, ny, nz = new_gw
-                    self._gate_world = (
-                        ox + GATE_EMA_ALPHA * (nx - ox),
-                        oy + GATE_EMA_ALPHA * (ny - oy),
-                        oz + GATE_EMA_ALPHA * (nz - oz),
-                    )
-                    if self._traj_idx == 0:
-                        self._traj = self._build_traj(self._gate_world)
+                    gate_idx = self._gates_passed + 1
+                    self._last_est_gate = new_gw
+                    snapped = self._zone_map.validate_and_snap(new_gw, gate_idx)
+                    self._last_est_in_zone = snapped is not None
+                    # Ignore refinements that drift out of the expected zone.
+                    if snapped is not None:
+                        ox, oy, oz = self._gate_world
+                        nx, ny, nz = snapped
+                        self._gate_world = (
+                            ox + GATE_EMA_ALPHA * (nx - ox),
+                            oy + GATE_EMA_ALPHA * (ny - oy),
+                            oz + GATE_EMA_ALPHA * (nz - oz),
+                        )
+                        if self._traj_idx == 0:
+                            self._traj = self._build_traj(self._gate_world)
 
                 # Gate close enough (bbox fills a large fraction of the frame):
                 # commit to a straight push through it before searching again.
