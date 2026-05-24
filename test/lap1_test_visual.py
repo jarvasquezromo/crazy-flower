@@ -176,14 +176,13 @@ CHASE_FORWARD = 0.12         # m/s forward creep (only applied once gate is cent
 ALIGN_FALLOFF = 0.60         # |ex| at which forward creep is fully suppressed (legacy)
 
 # --- Centred-approach / pass-through gating ---
-APPROACH_TOL_X = 0.08        # normalized |ex| to count as "centred" before creeping forward
+APPROACH_TOL_X = 0.05        # normalized |ex| to count as "centred" before creeping forward
 APPROACH_TOL_Y = 0.10        # normalized |ey| to count as "centred"
-PASS_CONFIRM_FRAMES = 3      # consecutive big-and-centred frames before committing to PUSH
-PASS_THROUGH_DIST = 0.6      # meters of forward travel in PUSH (distance-based, not time)
+PASS_CONFIRM_FRAMES = 5      # consecutive big-and-centred frames before committing to PUSH
+PASS_THROUGH_DIST = 1.2      # meters of forward travel in PUSH (distance-based, not time)
 PUSH_MAX_DURATION = 10.0     # seconds, PUSH safety timeout if travel never reached
 
 FORWARD_SPEED = 0.1          # m/s in body X, during push-through
-PUSH_DURATION_S = 1.0        # (legacy; PUSH now exits on PASS_THROUGH_DIST travel)
 TAKEOFF_HEIGHT  = 1.0        # meters above the starting position
 TAKEOFF_YAW_DEG = -90.0      # heading (deg) to face when takeoff completes
 TAKEOFF_YAW_TOL = 5.0        # deg; takeoff done once within this of the target heading
@@ -208,6 +207,7 @@ GATE_APPROX_EPS   = 0.04   # approxPolyDP epsilon, fraction of perimeter
 
 # --- Camera / world-frame projection (zone validation + map only) ---
 DEBUG_GATE_POSE = True               # print per-stage gate pose values for debugging
+DEBUG_CALIB     = True               # print per-detection calibration numbers (area %, ex/ey, ...)
 GATE_PHYS_H    = 0.4                 # metres, physical gate height — the only fixed dimension
                                      # (gate width varies between gates and foreshortens with yaw);
                                      # depth is derived from this height alone
@@ -612,6 +612,29 @@ class FPVWindow(QtWidgets.QWidget):
         if det.get("found", False) and sel_bbox is not None:
             cx, cy = int(round(det["cx"])), int(round(det["cy"]))
             cv2.circle(disp, (cx, cy), 4, (255, 0, 0), -1)
+
+        # --- Calibration readout ---------------------------------------------
+        # Live numbers for tuning the controller thresholds. Fly the drone to the
+        # exact spot where each transition *should* fire and read the value here.
+        area_pct = 0.0
+        if det.get("found", False) and sel_bbox is not None:
+            img_area = float(IMG_WIDTH * IMG_HEIGHT)
+            area_pct = 100.0 * float(det.get("area", 0.0)) / img_area   # polygon area %
+            _bx, _by, bw_b, bh_b = sel_bbox
+            bbox_pct = 100.0 * float(bw_b * bh_b) / img_area
+            aspect = bw_b / float(bh_b) if bh_b else 0.0
+            if DEBUG_CALIB:
+                print(
+                    f"[calib] area={area_pct:5.1f}% (PASS_AREA_FRAC={PASS_AREA_FRAC*100:.0f}%) "
+                    f"bbox={bbox_pct:5.1f}% | ex={det.get('ex', 0.0):+.3f} ey={det.get('ey', 0.0):+.3f} "
+                    f"(APPROACH_TOL x={APPROACH_TOL_X} y={APPROACH_TOL_Y}) "
+                    f"bbox_px={bw_b}x{bh_b} aspect={aspect:.2f} cands={det.get('n_candidates', 1)}"
+                )
+        # Overlay the area % on the image so it can be read live while flying.
+        cv2.putText(
+            disp, f"area={area_pct:.1f}%  PASS={PASS_AREA_FRAC*100:.0f}%",
+            (6, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA,
+        )
 
         # Crosshair
         h, w = disp.shape[:2]
