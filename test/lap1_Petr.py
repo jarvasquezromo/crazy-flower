@@ -260,15 +260,17 @@ def _quad_corners(cnt, approx):
     return ordered
 
 
-def _pixels_to_world(pixels, cam_pos, cam_rot, real_height=GATE_PHYS_H):
-    cx, cy = CAMERA_CX, CAMERA_CY
-    fx, fy = CAMERA_FX, CAMERA_FY
+def _pixels_to_world(pixels, cam_pos, cam_rot, img_shape, fov=1.5, real_height=GATE_PHYS_H):
+    h, w = img_shape[:2]
+    cx, cy = w / 2.0, h / 2.0
     cam_pos = np.asarray(cam_pos, dtype=float)
+
+    f = (w / 2.0) / np.tan(fov / 2.0)
 
     rays_world = []
     for (u, v) in pixels:
-        x_img = (u - cx) / fx
-        y_img = (v - cy) / fy
+        x_img = (u - cx) / f
+        y_img = (v - cy) / f
 
         ray_body = np.array([1.0, -x_img, -y_img], dtype=float)
         ray_body /= np.linalg.norm(ray_body)
@@ -758,8 +760,8 @@ class FPVWindow(QtWidgets.QWidget):
                 self._state_t0   = now
 
         self._pos['z'] = float(np.clip(self._pos['z'], MIN_HEIGHT, MAX_HEIGHT))
-        #self.cf.commander.send_position_setpoint(
-        #    self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'])
+        self.cf.commander.send_position_setpoint(
+            self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'])
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat():
@@ -838,7 +840,7 @@ class FPVWindow(QtWidgets.QWidget):
             dtype=float,
         )
 
-        world_corners = _pixels_to_world(corners, cam_pos, cam_rot)
+        world_corners = _pixels_to_world(corners, cam_pos, cam_rot, (IMG_HEIGHT, IMG_WIDTH, 3))
         if world_corners is None:
             return None
 
