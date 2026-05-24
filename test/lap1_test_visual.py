@@ -174,6 +174,9 @@ K_LATERAL = 0.12             # m/s body-Y per normalized x error
 MAX_LATERAL = 0.15           # m/s lateral clamp
 CHASE_FORWARD = 0.12         # m/s forward creep (only applied once gate is centred)
 ALIGN_FALLOFF = 0.60         # |ex| at which forward creep is fully suppressed (legacy)
+CHASE_RETURN_K = 0.6         # proportional velocity gain back to last good CHASE pose
+CHASE_RETURN_MAX_SPEED = 0.12  # m/s clamp when returning after losing the gate
+CHASE_RETURN_TOL = 0.05      # m; stop once back at the last good CHASE pose
 
 # --- Centred-approach / pass-through gating ---
 APPROACH_TOL_X = 0.05        # normalized |ex| to count as "centred" before creeping forward
@@ -549,6 +552,7 @@ class FPVWindow(QtWidgets.QWidget):
         self._search_confirm = []      # snapped (x,y,z) of consecutive in-zone hits in SEARCH
         self._push_confirm = 0         # consecutive big-and-centred frames before PUSH
         self._push_start = (0.0, 0.0)  # (x, y) odometry at PUSH entry, for distance-based exit
+        self._last_chase_gate_pose = None  # drone pose where target gate was last visible in CHASE
 
         # Simple autonomy state machine.
         self._gate_state = "WAIT"  # WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> SEARCH ...
@@ -596,6 +600,7 @@ class FPVWindow(QtWidgets.QWidget):
                 "bbox": det.get("bbox", None),
                 "area": float(det.get("area", 0.0)),
                 "corners": det.get("corners", None),
+                "candidates": det.get("candidates", []),
             }
 
         # Debug overlay on the RGB image: candidates thin/yellow, selected thick/green.
@@ -671,6 +676,7 @@ class FPVWindow(QtWidgets.QWidget):
             bbox    = self._vision.get("bbox", None)
             area    = float(self._vision.get("area", 0.0))
             corners = self._vision.get("corners", None)
+            candidates = list(self._vision.get("candidates", []))
         with self._pos_lock:
             est = dict(self._est)
 
@@ -735,6 +741,7 @@ class FPVWindow(QtWidgets.QWidget):
                     avg = tuple(np.mean(np.asarray(self._search_confirm, dtype=np.float64), axis=0))
                     self._search_confirm = []
                     self._gate_world = avg
+                    self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
                     self._gate_state = "CHASE"
                     self._state_t0 = now
             else:
@@ -745,51 +752,82 @@ class FPVWindow(QtWidgets.QWidget):
                 # Lost the gate for too long — give up and search again.
                 self._gate_world = None
                 self._push_confirm = 0
+                self._last_chase_gate_pose = None
                 self._gate_state = "SEARCH"
                 self._state_t0   = now
             elif not found or bbox is None:
-                # Momentarily lost: hover, reset the push streak, wait for
-                # re-detection / timeout.
+                # Momentarily lost: return to the last pose where the current
+                # gate was visible in CHASE, then hold there for re-detection.
                 self._push_confirm = 0
+                if self._last_chase_gate_pose is not None:
+                    x_cmd, y_cmd = self._return_to_last_chase_gate_pose(est, dt)
             else:
-                # Keep validating against the zone for the map (display only).
-                gw = self._gate_to_world(corners)
-                if gw is not None:
-                    gate_idx = self._gates_passed + 1
-                    self._last_est_gate = gw
-                    snapped = self._zone_map.validate_and_snap(gw, gate_idx)
-                    self._last_est_in_zone = snapped is not None
-                    if snapped is not None:
-                        self._gate_world = snapped
+                # Stay locked on the gate found in SEARCH: only steer toward a
+                # detection that belongs to that gate's zone. Gates from other
+                # zones drifting into view are ignored (we do NOT re-centre on
+                # them). self._gate_world stays as locked in SEARCH.
+                gate_idx = self._gates_passed + 1
+                sel = self._select_target_candidate(candidates, gate_idx)
 
-                # --- Always servo yaw + height to centre the gate ---
-                yaw_cmd = float(np.clip(-K_YAW * ex, -MAX_YAWRATE, MAX_YAWRATE))
-                y_cmd = float(np.clip(-K_LATERAL * ex, -MAX_LATERAL, MAX_LATERAL))
-                # Height: ey > 0 means gate below image centre -> descend.
-                dh = float(np.clip(-K_HEIGHT * ey, -MAX_DH_PER_S, MAX_DH_PER_S))
-                self.hover['height'] = float(
-                    np.clip(self.hover['height'] + dh * dt, MIN_HEIGHT, MAX_HEIGHT))
-
-                centred = (abs(ex) <= APPROACH_TOL_X) and (abs(ey) <= APPROACH_TOL_Y)
-
-                # Commit to PUSH only after the gate is BIG and CENTRED for a few
-                # consecutive frames (robust against one-off area spikes / drift).
-                if centred and (area / img_area > PASS_AREA_FRAC):
-                    self._push_confirm += 1
+                if sel is not None:
+                    cand, snapped = sel
+                    ex_t, ey_t, area_t = cand["ex"], cand["ey"], cand["area"]
+                    self._last_est_gate = snapped
+                    self._last_est_in_zone = True
+                    self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
+                    self._state_t0 = now
                 else:
-                    self._push_confirm = 0
+                    # No in-zone gate this frame. If the target is just clipping
+                    # the frame at close range (no usable projection) trust the
+                    # current detection for the final approach; otherwise it is a
+                    # foreign-zone gate -> ignore it and hold.
+                    primary_gw = self._gate_to_world(corners)
+                    if found and primary_gw is None and (area / img_area) > 0.5 * PASS_AREA_FRAC:
+                        ex_t, ey_t, area_t = ex, ey, area
+                        self._last_est_in_zone = None
+                        self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
+                        self._state_t0 = now
+                    else:
+                        if primary_gw is not None:
+                            self._last_est_gate = primary_gw
+                        self._last_est_in_zone = False
+                        ex_t = ey_t = area_t = None
 
-                if self._push_confirm >= PASS_CONFIRM_FRAMES:
+                if ex_t is None:
+                    # Target gate not visible this frame: return to the last
+                    # CHASE pose where it was visible, then wait / timeout.
                     self._push_confirm = 0
-                    self._push_start = (est['x'], est['y'])
-                    self._gate_state = "PUSH"
-                    self._state_t0   = now
-                elif centred:
-                    # Aligned but not yet close: creep straight forward, slowly.
-                    x_cmd = CHASE_FORWARD
+                    if self._last_chase_gate_pose is not None:
+                        x_cmd, y_cmd = self._return_to_last_chase_gate_pose(est, dt)
                 else:
-                    # Not centred: hold position and keep rotating/raising to centre.
-                    x_cmd = 0.0
+                    # --- Servo yaw + height to centre the TARGET gate ---
+                    yaw_cmd = float(np.clip(-K_YAW * ex_t, -MAX_YAWRATE, MAX_YAWRATE))
+                    y_cmd = float(np.clip(-K_LATERAL * ex_t, -MAX_LATERAL, MAX_LATERAL))
+                    # Height: ey > 0 means gate below image centre -> descend.
+                    dh = float(np.clip(-K_HEIGHT * ey_t, -MAX_DH_PER_S, MAX_DH_PER_S))
+                    self.hover['height'] = float(
+                        np.clip(self.hover['height'] + dh * dt, MIN_HEIGHT, MAX_HEIGHT))
+
+                    centred = (abs(ex_t) <= APPROACH_TOL_X) and (abs(ey_t) <= APPROACH_TOL_Y)
+
+                    # Commit to PUSH only after the gate is BIG and CENTRED for a
+                    # few consecutive frames (robust against one-off area spikes).
+                    if centred and (area_t / img_area > PASS_AREA_FRAC):
+                        self._push_confirm += 1
+                    else:
+                        self._push_confirm = 0
+
+                    if self._push_confirm >= PASS_CONFIRM_FRAMES:
+                        self._push_confirm = 0
+                        self._push_start = (est['x'], est['y'])
+                        self._gate_state = "PUSH"
+                        self._state_t0   = now
+                    elif centred:
+                        # Aligned but not yet close: creep straight forward, slowly.
+                        x_cmd = CHASE_FORWARD
+                    else:
+                        # Not centred: hold and keep rotating/raising to centre.
+                        x_cmd = 0.0
 
         elif self._gate_state == "PUSH":
             # Drive straight forward (yaw held) until we have travelled
@@ -801,6 +839,7 @@ class FPVWindow(QtWidgets.QWidget):
             if travelled >= PASS_THROUGH_DIST or (now - self._state_t0) >= PUSH_MAX_DURATION:
                 self._gates_passed += 1
                 self._gate_world = None
+                self._last_chase_gate_pose = None
                 if self._gates_passed >= MAX_GATES:
                     self._gate_state = "DONE"
                     self.cf.commander.send_stop_setpoint()
@@ -816,6 +855,34 @@ class FPVWindow(QtWidgets.QWidget):
         self.hover['height'] = float(np.clip(self.hover['height'], MIN_HEIGHT, MAX_HEIGHT))
         self.cf.commander.send_hover_setpoint(
             self.hover['x'], self.hover['y'], self.hover['yaw'], self.hover['height'])
+
+    def _return_to_last_chase_gate_pose(self, est, dt):
+        tx, ty, th = self._last_chase_gate_pose
+        dx = float(tx - est['x'])
+        dy = float(ty - est['y'])
+
+        x_cmd = 0.0
+        y_cmd = 0.0
+        if np.hypot(dx, dy) > CHASE_RETURN_TOL:
+            yaw_rad = np.radians(est['yaw'])
+            fwd_x, fwd_y = np.cos(yaw_rad), np.sin(yaw_rad)
+            left_x, left_y = -np.sin(yaw_rad), np.cos(yaw_rad)
+            vx_w = np.clip(CHASE_RETURN_K * dx, -CHASE_RETURN_MAX_SPEED, CHASE_RETURN_MAX_SPEED)
+            vy_w = np.clip(CHASE_RETURN_K * dy, -CHASE_RETURN_MAX_SPEED, CHASE_RETURN_MAX_SPEED)
+            x_cmd = float(np.clip(
+                vx_w * fwd_x + vy_w * fwd_y,
+                -CHASE_RETURN_MAX_SPEED,
+                CHASE_RETURN_MAX_SPEED,
+            ))
+            y_cmd = float(np.clip(
+                vx_w * left_x + vy_w * left_y,
+                -CHASE_RETURN_MAX_SPEED,
+                CHASE_RETURN_MAX_SPEED,
+            ))
+
+        dh = float(np.clip(th - self.hover['height'], -MAX_DH_PER_S * dt, MAX_DH_PER_S * dt))
+        self.hover['height'] = float(np.clip(self.hover['height'] + dh, MIN_HEIGHT, MAX_HEIGHT))
+        return x_cmd, y_cmd
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat():
@@ -885,7 +952,7 @@ class FPVWindow(QtWidgets.QWidget):
             self._est['z']   = data['stateEstimate.z']
             self._est['yaw'] = data['stabilizer.yaw']
 
-    def _gate_to_world(self, corners):
+    def _gate_to_world(self, corners, verbose=True):
         """Project the four gate corners to a world-frame gate centre.
 
         Used ONLY for the zone validation/snap and the top-down map — the drone
@@ -934,7 +1001,7 @@ class FPVWindow(QtWidgets.QWidget):
         gx, gy, gz = world_corners.mean(axis=0)
         gz = float(np.clip(gz, MIN_HEIGHT, MAX_HEIGHT))
 
-        if DEBUG_GATE_POSE:
+        if DEBUG_GATE_POSE and verbose:
             gate_left = 0.5 * (p_tl + p_bl)
             gate_right = 0.5 * (p_tr + p_br)
             ang = float(np.degrees(np.arctan2(
@@ -946,6 +1013,35 @@ class FPVWindow(QtWidgets.QWidget):
                 f"yaw={yaw_dbg:.0f}) -> gate(x={gx:.2f} y={gy:.2f} z={gz:.2f})"
             )
         return float(gx), float(gy), gz
+
+    def _select_target_candidate(self, candidates, gate_idx):
+        """Pick the detected gate that belongs to the target gate's zone.
+
+        Among all candidates this frame, keep only those whose world projection
+        validates into ``gate_idx``'s zone, and return the one closest to the
+        gate position locked in SEARCH (``self._gate_world``). This keeps CHASE
+        tracking the single gate we committed to and ignores gates from other
+        zones that wander into the frame. Returns ``(candidate, snapped_xyz)``
+        or ``None`` if no candidate falls in the zone.
+        """
+        best = None
+        best_d = float('inf')
+        locked = self._gate_world
+        for c in candidates:
+            gw = self._gate_to_world(c.get("corners"), verbose=False)
+            if gw is None:
+                continue
+            snapped = self._zone_map.validate_and_snap(gw, gate_idx)
+            if snapped is None:
+                continue
+            if locked is not None:
+                d = (snapped[0] - locked[0]) ** 2 + (snapped[1] - locked[1]) ** 2
+            else:
+                d = 0.0
+            if d < best_d:
+                best_d = d
+                best = (c, snapped)
+        return best
 
     def _set_status(self, text):
         """Thread-safe status label update."""
