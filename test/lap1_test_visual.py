@@ -184,6 +184,9 @@ APPROACH_TOL_Y = 0.10        # normalized |ey| to count as "centred"
 PASS_CONFIRM_FRAMES = 5      # consecutive big-and-centred frames before committing to PUSH
 PASS_THROUGH_DIST = 1.2      # meters of forward travel in PUSH (distance-based, not time)
 PUSH_MAX_DURATION = 10.0     # seconds, PUSH safety timeout if travel never reached
+PUSH_FALLBACK_AREA_FRAC = 0.10  # push if CHASE stalls after reaching this area fraction
+PUSH_AREA_STALL_FRAMES = 8   # consecutive frames without meaningful area growth
+PUSH_AREA_GROWTH_EPS = 0.003 # area fraction increase required to reset stall counter
 
 FORWARD_SPEED = 0.1          # m/s in body X, during push-through
 TAKEOFF_HEIGHT  = 1.0        # meters above the starting position
@@ -197,6 +200,8 @@ MIN_HEIGHT = 0.2             # meters (safety clamp)
 MAX_HEIGHT = 2.0             # meters (safety clamp)
 K_HEIGHT = 1.2               # (m/s) per normalized vertical error
 MAX_DH_PER_S = 0.3           # max height change rate (gentle)
+HEIGHT_SLOWDOWN_AREA_FRAC = 0.06  # start reducing z servo gain as the gate gets close
+HEIGHT_MIN_SCALE = 0.30      # minimum z servo gain/rate scale near pass-through
 
 MORPH_KERNEL = np.ones((5, 5), np.uint8)
 
@@ -553,6 +558,8 @@ class FPVWindow(QtWidgets.QWidget):
         self._push_confirm = 0         # consecutive big-and-centred frames before PUSH
         self._push_start = (0.0, 0.0)  # (x, y) odometry at PUSH entry, for distance-based exit
         self._last_chase_gate_pose = None  # drone pose where target gate was last visible in CHASE
+        self._chase_best_area_frac = 0.0
+        self._chase_area_stall = 0
 
         # Simple autonomy state machine.
         self._gate_state = "WAIT"  # WAIT -> TAKEOFF -> SEARCH -> CHASE -> PUSH -> SEARCH ...
@@ -742,6 +749,8 @@ class FPVWindow(QtWidgets.QWidget):
                     self._search_confirm = []
                     self._gate_world = avg
                     self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
+                    self._chase_best_area_frac = 0.0
+                    self._chase_area_stall = 0
                     self._gate_state = "CHASE"
                     self._state_t0 = now
             else:
@@ -753,12 +762,15 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gate_world = None
                 self._push_confirm = 0
                 self._last_chase_gate_pose = None
+                self._chase_best_area_frac = 0.0
+                self._chase_area_stall = 0
                 self._gate_state = "SEARCH"
                 self._state_t0   = now
             elif not found or bbox is None:
                 # Momentarily lost: return to the last pose where the current
                 # gate was visible in CHASE, then hold there for re-detection.
                 self._push_confirm = 0
+                self._chase_area_stall = 0
                 if self._last_chase_gate_pose is not None:
                     x_cmd, y_cmd = self._return_to_last_chase_gate_pose(est, dt)
             else:
@@ -800,11 +812,23 @@ class FPVWindow(QtWidgets.QWidget):
                     if self._last_chase_gate_pose is not None:
                         x_cmd, y_cmd = self._return_to_last_chase_gate_pose(est, dt)
                 else:
+                    area_frac = area_t / img_area
+
                     # --- Servo yaw + height to centre the TARGET gate ---
                     yaw_cmd = float(np.clip(-K_YAW * ex_t, -MAX_YAWRATE, MAX_YAWRATE))
                     y_cmd = float(np.clip(-K_LATERAL * ex_t, -MAX_LATERAL, MAX_LATERAL))
                     # Height: ey > 0 means gate below image centre -> descend.
-                    dh = float(np.clip(-K_HEIGHT * ey_t, -MAX_DH_PER_S, MAX_DH_PER_S))
+                    # Close to the gate, centre estimates get noisy because the
+                    # gate occupies many pixels; reduce z corrections there.
+                    slowdown_span = max(PASS_AREA_FRAC - HEIGHT_SLOWDOWN_AREA_FRAC, 1e-6)
+                    slowdown = float(np.clip(
+                        (area_frac - HEIGHT_SLOWDOWN_AREA_FRAC) / slowdown_span,
+                        0.0,
+                        1.0,
+                    ))
+                    height_scale = 1.0 - slowdown * (1.0 - HEIGHT_MIN_SCALE)
+                    max_dh = MAX_DH_PER_S * height_scale
+                    dh = float(np.clip(-K_HEIGHT * height_scale * ey_t, -max_dh, max_dh))
                     self.hover['height'] = float(
                         np.clip(self.hover['height'] + dh * dt, MIN_HEIGHT, MAX_HEIGHT))
 
@@ -812,13 +836,26 @@ class FPVWindow(QtWidgets.QWidget):
 
                     # Commit to PUSH only after the gate is BIG and CENTRED for a
                     # few consecutive frames (robust against one-off area spikes).
-                    if centred and (area_t / img_area > PASS_AREA_FRAC):
+                    if area_frac > self._chase_best_area_frac + PUSH_AREA_GROWTH_EPS:
+                        self._chase_best_area_frac = area_frac
+                        self._chase_area_stall = 0
+                    else:
+                        self._chase_area_stall += 1
+
+                    fallback_push = (
+                        area_frac >= PUSH_FALLBACK_AREA_FRAC
+                        and self._chase_area_stall >= PUSH_AREA_STALL_FRAMES
+                    )
+
+                    if centred and (area_frac > PASS_AREA_FRAC):
                         self._push_confirm += 1
                     else:
                         self._push_confirm = 0
 
-                    if self._push_confirm >= PASS_CONFIRM_FRAMES:
+                    if self._push_confirm >= PASS_CONFIRM_FRAMES or fallback_push:
                         self._push_confirm = 0
+                        self._chase_best_area_frac = 0.0
+                        self._chase_area_stall = 0
                         self._push_start = (est['x'], est['y'])
                         self._gate_state = "PUSH"
                         self._state_t0   = now
@@ -840,6 +877,8 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gates_passed += 1
                 self._gate_world = None
                 self._last_chase_gate_pose = None
+                self._chase_best_area_frac = 0.0
+                self._chase_area_stall = 0
                 if self._gates_passed >= MAX_GATES:
                     self._gate_state = "DONE"
                     self.cf.commander.send_stop_setpoint()
