@@ -166,7 +166,7 @@ def _undistort_image(rgb_img):
 # Start with this, then adjust if needed.
 GREEN_HSV_LO = np.array([35, 50, 50], dtype=np.uint8)
 GREEN_HSV_HI = np.array([85, 255, 255], dtype=np.uint8)
-GREEN_MIN_V = 240            # set lower (e.g. 120) if detection is too strict
+GREEN_MIN_V = 180            # set lower (e.g. 120) if detection is too strict
 
 MIN_GREEN_AREA_FRAC = 0.01   # fraction of image area
 CENTER_TOL_X = 0.10          # normalized (0..1) horizontal tolerance
@@ -213,7 +213,7 @@ GATE_EMA_ALPHA = 0.35                # weight for EMA update of locked gate posi
 GATE_LOCK_MIN_OBS        = 3       # minimum observations before committing
 GATE_LOCK_MAX_OBS        = 5       # keep only the most recent estimates
 GATE_LOCK_MAX_AGE_S      = 1.0     # discard stale observations
-GATE_LOCK_MAX_SPREAD_XY  = 0.30    # metres; tighten if still jumpy, loosen if too strict
+GATE_LOCK_MAX_SPREAD_XY  = 0.40    # metres; tighten if still jumpy, loosen if too strict
 CHASE_UPDATE_MAX_JUMP_XY = 0.60    # metres; ignore crazy PnP jumps during CHASE
 PNP_RANGE_MIN            = 0.25    # metres; reject impossible camera-frame depth
 PNP_RANGE_MAX            = 5.00    # metres; adjust to your arena size

@@ -511,11 +511,6 @@ class FPVWindow(QtWidgets.QWidget):
                     "yaw": float(est.get("yaw", 0.0)),
                 },
             })
-            try:
-                with open(DETECTION_LOG_PATH, 'w', encoding='utf-8') as f:
-                    json.dump(self._detections, f, indent=2)
-            except Exception as e:
-                print(f"Failed to save gate detections: {e}")
         
         with self._vision_lock:
             self._vision = {
