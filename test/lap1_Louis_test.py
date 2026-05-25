@@ -172,8 +172,8 @@ MIN_GREEN_AREA_FRAC = 0.01  # fraction of image area
 CENTER_TOL_X = 0.10  # normalized (0..1) horizontal tolerance
 CENTER_TOL_Y = 0.12  # normalized (0..1) vertical tolerance
 
-# Slow & robust profile: gentle yaw scan, gentle servo gains.
-SEARCH_YAWRATE = 12.0  # deg/s, negative = turn left (slow ~30 s full scan)
+# Slow & robust profile: continuous 360° yaw scan, slow enough for low FPS video.
+SEARCH_YAWRATE = 15.0  # deg/s, slow full sweep (~24 s per 360°)
 MAX_YAWRATE = 40.0  # deg/s
 K_YAW = 50.0  # deg/s per normalized x error
 
@@ -643,6 +643,7 @@ class FPVWindow(QtWidgets.QWidget):
         # Major-command lock state: do not chain large target changes too quickly.
         self._wp_settle_until = 0.0
         self._last_replan_time = 0.0
+        self._search_scan_yaw = TAKEOFF_YAW_DEG
 
         self._last_ctrl_time = time.monotonic()
 
@@ -817,6 +818,7 @@ class FPVWindow(QtWidgets.QWidget):
                 and abs(yaw_err) <= TAKEOFF_YAW_TOL
             ):
                 self._gate_state = "SEARCH"
+                self._search_scan_yaw = float(self._pos["yaw"])
                 self._last_seen_time = None
                 self._state_t0 = now
 
@@ -855,6 +857,11 @@ class FPVWindow(QtWidgets.QWidget):
                     self._wp_settle_until = now + WAYPOINT_SETTLE_S
                     self._last_replan_time = now
             else:
+                # Slow continuous 360° sweep: the drone keeps turning until a
+                # good gate lock is obtained, which suits 1-2 FPS video much
+                # better than a small oscillation.
+                self._search_scan_yaw += SEARCH_YAWRATE * dt
+                self._pos["yaw"] = float(self._search_scan_yaw)
                 self._search_confirm = []
 
         elif self._gate_state == "CHASE":
@@ -1031,6 +1038,7 @@ class FPVWindow(QtWidgets.QWidget):
                         self._pos["yaw"] = est["yaw"] - CHASE_RECOVER_YAWRATE * dt
                     else:
                         self._gate_state = "SEARCH"
+                        self._search_scan_yaw = float(est["yaw"])
                         self._last_seen_time = None
                         self._state_t0 = now
 
@@ -1067,6 +1075,7 @@ class FPVWindow(QtWidgets.QWidget):
                     self._timer.stop()
                     return
                 self._gate_state = "SEARCH"
+                self._search_scan_yaw = float(est["yaw"])
                 self._last_seen_time = None
                 self._state_t0 = now
 
