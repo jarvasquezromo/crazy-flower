@@ -41,6 +41,16 @@ MIN_JPEG_BYTES = 5000
 DEFAULT_IMG_W = 324
 DEFAULT_IMG_H = 244
 
+MIN_GATE_V = 240
+MIN_GATE_AREA_FRAC = 0.01
+GATE_MIN_VERTICES = 4
+GATE_MAX_VERTICES = 8
+GATE_ASPECT_MIN = 0.45
+GATE_ASPECT_MAX = 2.2
+GATE_MIN_SOLIDITY = 0.80
+GATE_APPROX_EPS = 0.04
+MORPH_KERNEL = np.ones((5, 5), np.uint8)
+
 
 @contextlib.contextmanager
 def _muted_stderr():
@@ -70,20 +80,21 @@ class Surveyer:
         self.detected_gate_ids = []
         self.detected_gate_angles = []
         self.pass_through_distance = 0.5
-        self.stabilization_wait_duration = 0.35
+        self.stabilization_wait_duration = 6
         self.stabilization_start_time = None
         self.stabilization_context = None
-        self.mapping_radii = [1, 1.5, 2]
+        self.mapping_radii = [0.75, 1.1, 1.4]
         self.mapping_radius_idx = 0
         self.height_offset = 0.0
         self.angle_offset = 0.0
+        self._last_mapping_key = None
 
     def _reset_stabilization(self):
         self.stabilization_start_time = None
         self.stabilization_context = None
 
     def _stable_at_target(self, sensor_data, control_command, context_key):
-        if not self.reached_target(sensor_data, control_command):
+        if not self.reached_target(sensor_data, control_command, threshold=0.5):
             self._reset_stabilization()
             return False
 
@@ -105,51 +116,85 @@ class Surveyer:
         self.detected_gate_ids.append(gate_id)
         self.detected_gate_angles.append(float(gate_angle))
 
-    def get_masked_image(self, camera_data):
-        bgr = camera_data[:, :, [0, 1, 2]]
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    def _order_corners(self, pts):
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+        s = pts[:, 0] + pts[:, 1]
+        d = pts[:, 0] - pts[:, 1]
+        return np.array([
+            pts[np.argmin(s)],
+            pts[np.argmax(d)],
+            pts[np.argmax(s)],
+            pts[np.argmin(d)],
+        ], dtype=np.float64)
 
-        lower = np.array([260 / 2, 20, 0])
-        upper = np.array([330 / 2, 255, 255])
-        return cv2.inRange(hsv, lower, upper)
+    def _quad_corners(self, contour, approx):
+        if len(approx) == 4:
+            pts = approx.reshape(-1, 2).astype(np.float64)
+        else:
+            pts = cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float64)
+        ordered = self._order_corners(pts)
+        if len(np.unique(np.round(ordered, 1), axis=0)) != 4:
+            return None
+        return ordered
 
-    def get_biggest_contour(self, mask):
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            biggest_contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(biggest_contour) < 10:
-                return None
-            return biggest_contour
-        return None
-
-    def get_gate_corners(self, contour):
-        hull = cv2.convexHull(contour)
-        perimeter = cv2.arcLength(hull, True)
-        if perimeter < 1e-6:
+    def _gate_candidate(self, contour, img_w, img_h):
+        area = float(cv2.contourArea(contour))
+        if area < (MIN_GATE_AREA_FRAC * float(img_w * img_h)):
             return None
 
-        for epsilon_scale in (0.01, 0.015, 0.02, 0.03, 0.04, 0.06, 0.08, 0.1):
-            approx = cv2.approxPolyDP(hull, epsilon_scale * perimeter, True)
-            if len(approx) == 4:
-                return approx.reshape(-1, 2).astype(np.int32)
+        peri = cv2.arcLength(contour, True)
+        if peri <= 1e-6:
+            return None
 
-        return None
+        approx = cv2.approxPolyDP(contour, GATE_APPROX_EPS * peri, True)
+        n_vert = len(approx)
+        if not (GATE_MIN_VERTICES <= n_vert <= GATE_MAX_VERTICES):
+            return None
 
-    def is_gate_fully_contained_in_screen(self, corners, img_shape, margin_pixels=15):
-        h, w = img_shape[:2]
-        for corner in corners:
-            x, y = corner
-            if x < margin_pixels or x > w - margin_pixels or y < margin_pixels or y > h - margin_pixels:
-                return False
-        return True
+        x, y, bw, bh = cv2.boundingRect(contour)
+        if bh <= 0:
+            return None
+        aspect = bw / float(bh)
+        if not (GATE_ASPECT_MIN <= aspect <= GATE_ASPECT_MAX):
+            return None
 
-    def order_points(self, pts):
-        pts = pts[np.argsort(pts[:, 1])]
-        top = pts[:2]
-        bottom = pts[2:]
-        top = top[np.argsort(top[:, 0])]
-        bottom = bottom[np.argsort(bottom[:, 0])]
-        return np.array([top[0], top[1], bottom[1], bottom[0]])
+        hull_area = cv2.contourArea(cv2.convexHull(contour))
+        solidity = area / hull_area if hull_area > 1e-6 else 0.0
+        if solidity < GATE_MIN_SOLIDITY:
+            return None
+
+        m = cv2.moments(approx)
+        if abs(m.get("m00", 0.0)) < 1e-6:
+            pts = approx.reshape(-1, 2).astype(np.float64)
+            cx = float(pts[:, 0].mean())
+            cy = float(pts[:, 1].mean())
+        else:
+            cx = float(m["m10"] / m["m00"])
+            cy = float(m["m01"] / m["m00"])
+
+        corners = self._quad_corners(contour, approx)
+        if corners is None:
+            return None
+
+        return {"cx": cx, "cy": cy, "corners": corners}
+
+    def _detect_gate_outline(self, camera_data):
+        h, w = camera_data.shape[:2]
+        gray = cv2.cvtColor(camera_data, cv2.COLOR_BGR2GRAY)
+        mask = np.where(gray >= int(MIN_GATE_V), np.uint8(255), np.uint8(0))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=3)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
+        for contour in contours:
+            cand = self._gate_candidate(contour, w, h)
+            if cand is not None:
+                candidates.append(cand)
+
+        if not candidates:
+            return None
+
+        return max(candidates, key=lambda c: c["cx"])
 
     def pixels_to_world(self, pixels, cam_pos, cam_rot, img_shape, fov=1.5, real_height=0.4):
         h, w, _ = img_shape
@@ -214,22 +259,13 @@ class Surveyer:
         ], dtype=float)
 
     def detect_gate(self, camera_data, sensor_data, check=False):
-        mask = self.get_masked_image(camera_data)
-        contour = self.get_biggest_contour(mask)
-        if contour is None:
+        candidate = self._detect_gate_outline(camera_data)
+        if candidate is None:
             return None, None
 
-        corners = self.get_gate_corners(contour)
-        if corners is None:
-            return None, None
-        corners = self.order_points(corners)
-
-        if not self.is_gate_fully_contained_in_screen(corners, camera_data.shape):
-            return None, None
-
-        gate_area = cv2.contourArea(corners)
+        corners = candidate["corners"]
         if check:
-            print("Checking gate detection: area =", gate_area)
+            print("Checking gate detection: corners =", corners)
 
         position = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']]
         rotation_matrix = self.quaternion_to_rotation_matrix(
@@ -250,11 +286,11 @@ class Surveyer:
         if radius is None:
             radius = self.mapping_radii[self.mapping_radius_idx]
 
-        angle = position_id * (np.pi / 3) + np.pi / 6 - np.pi
+        angle = position_id * (np.pi / 3) + np.pi / 12 - np.pi
         target_y = COURSE_CENTER_Y + np.sin(angle) * radius
         target_x = COURSE_CENTER_X + np.cos(angle) * radius
-        target_z = 1.35
-        target_yaw = angle + np.pi / 2 + np.pi / 6
+        target_z = 1.1
+        target_yaw = -angle + np.pi / 2 + np.pi / 6 + np.pi / 12
 
         target_z += self.height_offset
         target_yaw += self.angle_offset
@@ -328,6 +364,10 @@ class Surveyer:
         if self.mapping_progress == 0:
             radius = self.mapping_radii[self.mapping_radius_idx]
             control_command = self.fly_to_mapping_position(gate_id, radius=radius)
+            mapping_key = (gate_id, self.mapping_radius_idx)
+            if mapping_key != self._last_mapping_key:
+                self._reset_stabilization()
+                self._last_mapping_key = mapping_key
             if self._stable_at_target(sensor_data, control_command, (gate_id, self.mapping_progress, self.mapping_radius_idx)):
                 if self.acquire_gate(sensor_data, camera_data):
                     observed_segment = self.segment_from_xy(self.gate_center[0], self.gate_center[1])
@@ -486,10 +526,13 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_ctrl_time = time.monotonic()
         self._log_ready = False
         self._cmd_pos = None
-        self._max_xy_speed = 0.6
-        self._max_z_speed = 0.4
-        self._max_yaw_rate = 60.0
+        self._max_xy_speed = 0.04
+        self._max_z_speed = 0.02
+        self._max_yaw_rate = 25.0
         self._debug_last = 0.0
+        self._debug_wait_last = 0.0
+        self._debug_frame_last = 0.0
+        self._debug_cmd_last = 0.0
 
         cflib.crtp.init_drivers()
         self.cf = Crazyflie(ro_cache=None, rw_cache='cache')
@@ -530,10 +573,16 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_ctrl_time = now
 
         if not self._log_ready:
+            if now - self._debug_wait_last >= 1.0:
+                self._debug_wait_last = now
+                print("Waiting for stateEstimate log...")
             return
 
         camera_data = self._last_frame
         if camera_data is None:
+            if now - self._debug_frame_last >= 1.0:
+                self._debug_frame_last = now
+                print("Waiting for camera frames from AI-deck...")
             return
 
         with self._pos_lock:
@@ -553,6 +602,11 @@ class FPVWindow(QtWidgets.QWidget):
         }
 
         cmd = self._controller.compute_command(sensor_data, camera_data, dt)
+        if not np.all(np.isfinite(cmd)):
+            if now - self._debug_cmd_last >= 1.0:
+                self._debug_cmd_last = now
+                print(f"Invalid cmd (non-finite): {cmd}")
+            return
         self._pos['x'], self._pos['y'], self._pos['z'], self._pos['yaw'] = self._ramp_setpoint(cmd, dt)
 
         if now - self._debug_last >= 0.5:
@@ -659,6 +713,7 @@ class FPVWindow(QtWidgets.QWidget):
         lc.start()
         self._log_cfg = lc
         print('StateEst log started — waiting for first Lighthouse position…')
+        print('Logging: stateEstimate.x/y/z, stabilizer.yaw')
 
     def _on_log(self, _ts, data, _lc):
         with self._pos_lock:

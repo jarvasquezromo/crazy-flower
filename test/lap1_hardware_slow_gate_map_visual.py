@@ -34,6 +34,7 @@ import struct
 import sys
 import threading
 import warnings
+import math
 import numpy as np
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
@@ -42,6 +43,16 @@ from cflib.utils import uri_helper
 from PyQt6 import QtCore, QtWidgets, QtGui
 import cv2
 import time
+
+try:
+    from gate_map import GateZoneMap
+    HAS_GATE_MAP = True
+    GATE_MAP_IMPORT_ERROR = None
+except Exception as _gate_map_error:
+    GateZoneMap = None
+    HAS_GATE_MAP = False
+    GATE_MAP_IMPORT_ERROR = _gate_map_error
+
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -144,12 +155,12 @@ MIN_GREEN_AREA_FRAC = 0.01   # fraction of image area
 CENTER_TOL_X = 0.10          # normalized (0..1) horizontal tolerance
 CENTER_TOL_Y = 0.12          # normalized (0..1) vertical tolerance
 
-SEARCH_YAWRATE = -20.0      # deg/s, negative = turn left (full scan in ~18 s)
-MAX_YAWRATE = 70.0           # deg/s
-K_YAW = 80.0                 # deg/s per normalized x error
+SEARCH_YAWRATE = -8.0       # slow scan for hardware stability      # deg/s, negative = turn left (full scan in ~18 s)
+MAX_YAWRATE = 28.0           # slower yaw to reduce jitter           # deg/s
+K_YAW = 28.0                 # gentler yaw gain                 # deg/s per normalized x error
 
 FORWARD_SPEED = 0.35         # m/s in body X, during push-through
-PUSH_DURATION_S = 2.0
+PUSH_DURATION_S = 1.0
 SEARCH_HEIGHT = 1.2          # meters, target height for search/center
 TAKEOFF_START_HEIGHT = 0.1   # meters, initial setpoint at takeoff
 TAKEOFF_RATE = 0.4           # m/s climb rate during takeoff ramp
@@ -157,8 +168,8 @@ MAX_GATES = 5
 
 MIN_HEIGHT = 0.2             # meters (safety clamp)
 MAX_HEIGHT = 2.0             # meters (safety clamp)
-K_HEIGHT = 1.2               # (m/s) per normalized vertical error
-MAX_DH_PER_S = 0.6           # max height change rate
+K_HEIGHT = 0.45              # gentler height correction               # (m/s) per normalized vertical error
+MAX_DH_PER_S = 0.20          # slower height changes           # max height change rate
 
 MORPH_KERNEL = np.ones((5, 5), np.uint8)
 
@@ -456,24 +467,24 @@ YAW_SIGN = -1.0
 # so the drone should usually go down.
 Z_SIGN = -1.0
 
-ACQUIRE_MIN_FRAMES = 6          # require this many stable detections before approach
+ACQUIRE_MIN_FRAMES = 12          # require this many stable detections before approach
 ACQUIRE_TIMEOUT_S = 3.0
-LOST_TO_SCAN_S = 0.45           # how long we tolerate losing the gate while acquiring/approaching
-CENTERED_FRAMES_TO_APPROACH = 3
+LOST_TO_SCAN_S = 0.80           # how long we tolerate losing the gate while acquiring/approaching
+CENTERED_FRAMES_TO_APPROACH = 6
 
-APPROACH_SPEED = 0.22           # m/s body-forward, conservative for hardware
-APPROACH_SPEED_SLOW = 0.10      # m/s if almost centered but not perfect
-PASS_SPEED = 0.32               # m/s body-forward through the gate
-PASS_DURATION_S = 2.15
-RECOVER_DURATION_S = 0.55
+APPROACH_SPEED = 0.12           # m/s body-forward, conservative for hardware
+APPROACH_SPEED_SLOW = 0.055      # m/s if almost centered but not perfect
+PASS_SPEED = 0.22               # m/s body-forward through the gate
+PASS_DURATION_S = 1.80
+RECOVER_DURATION_S = 1.20
 
 CENTER_TOL_X_APPROACH = 0.16    # allow slow forward if within this
 CENTER_TOL_Y_APPROACH = 0.18
 CENTER_TOL_X_PASS = 0.22        # pass if close and roughly centered
 CENTER_TOL_Y_PASS = 0.24
 
-PASS_AREA_FRAC = 0.13           # gate bbox/image area for "close enough to push"
-PASS_AREA_FRAC_FORCE = 0.20     # push even if not perfectly centered, because gate is very close
+PASS_AREA_FRAC = 0.14           # gate bbox/image area for "close enough to push"
+PASS_AREA_FRAC_FORCE = 0.24     # push even if not perfectly centered, because gate is very close
 
 STATUS_PERIOD_S = 0.12
 
@@ -487,14 +498,65 @@ USE_TRIANGULATION = True
 TRI_MIN_OBS = 5
 TRI_MIN_BASELINE = 0.12          # m; need sideways motion, not just one pose
 TRI_OBS_MIN_SPACING = 0.035      # m between stored observations
-TRI_MAX_MEAN_LINE_DIST = 0.18    # m; reject inconsistent ray intersection
-TRI_COLLECT_TIMEOUT_S = 3.2
-TRI_SWAY_SPEED = 0.07            # m/s body-left/right while collecting rays
-TRI_SWAY_PERIOD_S = 0.9
+TRI_MAX_MEAN_LINE_DIST = 0.22    # m; reject inconsistent ray intersection
+TRI_COLLECT_TIMEOUT_S = 4.0
+TRI_SWAY_SPEED = 0.045            # m/s body-left/right while collecting rays
+TRI_SWAY_PERIOD_S = 1.20
 TRI_COLLECT_TOL_X = 0.35         # only store if gate is not too far off-camera
 TRI_COLLECT_TOL_Y = 0.40
 TRI_MIN_Z = 0.25
 TRI_MAX_Z = 2.20
+
+# ---------------------------------------------------------------------------
+# Arena / slice guidance, adapted from the software assignment
+# ---------------------------------------------------------------------------
+# This is NOT used as a blind waypoint controller. It is used to:
+# 1) choose the most plausible gate when two gates are visible,
+# 2) reject a triangulated gate if it is in the wrong slice,
+# 3) draw a small arena visualization.
+#
+# IMPORTANT: Tune ARENA_CENTER_* and TRACK_RADIUS to your Lighthouse/world frame.
+# If these are wrong, set USE_ARENA_GUIDANCE = False and the script falls back
+# to purely image-based locking.
+# Keep this OFF unless you have calibrated the physical Lighthouse/world frame.
+# When False, the script still uses stable image locking, but it does NOT use
+# simulation slices to choose/reject gates. The map becomes a physical x/y
+# visualization of the estimator, trail, and triangulated gate estimates.
+# Now we can use the physical course geometry from gate_map.py.
+# If gate_map.py or gates_xyz.py is missing in your folder, the script will
+# fall back to image-locking and a physical x/y map.
+USE_ARENA_GUIDANCE = True
+
+# Fallback values only. If gate_map.py loads, COURSE_CENTER and gate positions
+# from that file override these during __init__.
+ARENA_CENTER_X = 1.15
+ARENA_CENTER_Y = 0.0
+TRACK_RADIUS = 1.50
+NUM_SLICES = 12
+# Internal 0-based slice convention used by this controller. This corresponds
+# to gate_map zones 1,3,5,7,9.
+GATE_SLICES = [2, 4, 6, 8, 10]
+SLICE_ACCEPT_TOL = 1             # accept expected slice +/- 1
+
+# Visualization-only settings for the real arena map.
+MAP_MIN_WINDOW_M = 3.0
+MAP_MARGIN_M = 0.60
+MAP_TRAIL_LEN = 300
+
+# Candidate locking: when two gates are visible, do not jump suddenly from one
+# image blob to the other. This is the key stability layer.
+IMAGE_LOCK_MAX_JUMP = 0.55       # normalized image distance
+LOCK_AREA_LOG_TOL = 1.40         # tolerate area ratio up/down by exp(1.4)
+LOCK_SCORE_MIN = -2.80
+
+# Extra smoothing / command rate limits.
+VISION_ALPHA = 0.16              # lower = smoother; old value was 0.35
+CMD_ALPHA = 0.18                 # low-pass on sent vx/vy/yawrate/z
+MAX_DVX_PER_S = 0.25
+MAX_DVY_PER_S = 0.18
+MAX_DYAWRATE_PER_S = 45.0
+MAX_DZCMD_PER_S = 0.25
+
 
 
 def _clip_float(value, lo, hi):
@@ -504,14 +566,16 @@ def _clip_float(value, lo, hi):
 class FPVWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Crazyflie Lap 1 - visual servo + triangulation")
+        self.setWindowTitle("Crazyflie Lap 1 - slow gate-map visual servo")
 
         self.image_label = QtWidgets.QLabel("Waiting for AI-deck video...")
         self.status_label = QtWidgets.QLabel("Starting...")
+        self.map_label = QtWidgets.QLabel("Arena map waiting for state estimate...")
 
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.image_label)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.map_label)
         self.setLayout(layout)
 
         # State estimator readout (updated by log callback).
@@ -563,6 +627,48 @@ class FPVWindow(QtWidgets.QWidget):
         # Detection log for debugging after a flight.
         self._detections = []
 
+        # Arena/slice logic.
+        # If gate_map.py is available, use the physical course centre and real
+        # gate coordinates from gates_xyz.py. Otherwise fall back to the simple
+        # physical x/y display and image locking.
+        self._zone_map = None
+        self._real_gates = {}
+        self._track_radius_dynamic = TRACK_RADIUS
+        self._arena_center = np.array([ARENA_CENTER_X, ARENA_CENTER_Y], dtype=float)
+
+        if USE_ARENA_GUIDANCE and HAS_GATE_MAP:
+            try:
+                self._zone_map = GateZoneMap()
+                self._arena_center = np.array([self._zone_map.cx, self._zone_map.cy], dtype=float)
+                self._real_gates = dict(getattr(self._zone_map, "gates", {}) or {})
+                if self._real_gates:
+                    rs = [
+                        float(np.hypot(x - self._arena_center[0], y - self._arena_center[1]))
+                        for (x, y, *_rest) in self._real_gates.values()
+                    ]
+                    self._track_radius_dynamic = float(np.mean(rs))
+                print(
+                    f"Loaded gate_map.py: center=({self._arena_center[0]:.2f}, "
+                    f"{self._arena_center[1]:.2f}), gates={len(self._real_gates)}, "
+                    f"mean_radius={self._track_radius_dynamic:.2f}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"gate_map.py failed to initialize, disabling arena guidance: {e}", flush=True)
+                self._zone_map = None
+        elif USE_ARENA_GUIDANCE and not HAS_GATE_MAP:
+            print(f"gate_map.py not available, disabling arena guidance: {GATE_MAP_IMPORT_ERROR}", flush=True)
+
+        self._slice_width = 2.0 * np.pi / float(NUM_SLICES)
+        self._saved_gates = [None] * MAX_GATES
+        self._gate_lock = None       # locked selected image candidate for current gate
+        self._selection_debug = "none"
+        self._last_cmd = {"vx": 0.0, "vy": 0.0, "yawrate": 0.0, "z": TAKEOFF_START_HEIGHT, "t": time.monotonic()}
+
+        # Physical-map visualization. This is only for display/debug; it does
+        # not affect control when USE_ARENA_GUIDANCE is False.
+        self._drone_trail = []
+
         cflib.crtp.init_drivers()
         self.cf = Crazyflie(ro_cache=None, rw_cache="cache")
         self.cf.connected.add_callback(self._connected)
@@ -587,6 +693,374 @@ class FPVWindow(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Vision update: gate detection is intentionally the same function.
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Arena helpers and robust candidate selection
+    # ------------------------------------------------------------------
+    def _wrap_to_pi(self, angle):
+        return (float(angle) + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _expected_gate_index(self):
+        return int(np.clip(self._gates_passed, 0, min(MAX_GATES, len(GATE_SLICES)) - 1))
+
+    def _expected_gate_slice(self):
+        if not GATE_SLICES:
+            return 0
+        return int(GATE_SLICES[self._expected_gate_index()])
+
+    def _angle_from_arena_center(self, x, y):
+        v = np.array([float(x), float(y)], dtype=float) - self._arena_center
+        if np.linalg.norm(v) < 1e-8:
+            return None
+        # Same convention as the software assignment.
+        return (np.arctan2(v[1], v[0]) + np.pi) % (2.0 * np.pi)
+
+    def _slice_idx(self, x, y):
+        ang = self._angle_from_arena_center(x, y)
+        if ang is None:
+            return -1
+        shifted = (ang + 0.5 * self._slice_width) % (2.0 * np.pi)
+        return int(shifted // self._slice_width)
+
+    def _slice_is_allowed(self, slice_idx):
+        expected = self._expected_gate_slice()
+        diff = min((slice_idx - expected) % NUM_SLICES, (expected - slice_idx) % NUM_SLICES)
+        return diff <= SLICE_ACCEPT_TOL, expected, diff
+
+    def _point_at_slice_center(self, slice_idx, radius=None, z=None):
+        if radius is None:
+            radius = self._track_radius_dynamic
+        if z is None:
+            z = SEARCH_HEIGHT
+        angle = (slice_idx % NUM_SLICES) * self._slice_width
+        u_r = np.array([np.cos(angle - np.pi), np.sin(angle - np.pi)], dtype=float)
+        xy = self._arena_center + float(radius) * u_r
+        return np.array([xy[0], xy[1], z], dtype=float)
+
+    def _candidate_norm(self, cand):
+        return np.array([
+            (float(cand["cx"]) - CAMERA_CX) / max(0.5 * IMG_WIDTH, 1.0),
+            (float(cand["cy"]) - CAMERA_CY) / max(0.5 * IMG_HEIGHT, 1.0),
+        ], dtype=float)
+
+    def _candidate_world_bearing(self, cand, est):
+        # Horizontal bearing of this image candidate in the world frame.
+        x_img = (float(cand["cx"]) - CAMERA_CX) / max(CAMERA_FX, 1e-6)
+        # Same sign convention as _bearing_ray_from_pixel(): image right -> body -Y.
+        rel_bearing = np.arctan2(-x_img, 1.0)
+        return self._wrap_to_pi(np.deg2rad(float(est["yaw"])) + rel_bearing)
+
+    def _expected_world_bearing(self, est):
+        gate_index_1based = self._expected_gate_index() + 1
+
+        # Best case: use the real gate coordinate loaded through gate_map.py /
+        # gates_xyz.py. This is much better when two gates are visible.
+        if self._real_gates and gate_index_1based in self._real_gates:
+            gx, gy, *_rest = self._real_gates[gate_index_1based]
+            target = np.array([gx, gy], dtype=float)
+        elif self._zone_map is not None:
+            # Fallback: use only the gate zone bearing from gate_map.py.
+            bearing_deg = self._zone_map.gate_center_deg(gate_index_1based)
+            r = self._track_radius_dynamic
+            target = np.array([
+                self._arena_center[0] + r * math.cos(math.radians(bearing_deg)),
+                self._arena_center[1] + r * math.sin(math.radians(bearing_deg)),
+            ], dtype=float)
+        else:
+            target = self._point_at_slice_center(self._expected_gate_slice())[:2]
+
+        dx = target[0] - float(est["x"])
+        dy = target[1] - float(est["y"])
+        return np.arctan2(dy, dx)
+
+    def _select_gate_with_context(self, raw_det):
+        """Keep the original detection, but replace the fragile 'rightmost gate'
+        decision with a stable, context-aware selection.
+
+        Priority:
+        1. If we already locked a gate, choose the candidate closest to that
+           previous image location/area. This prevents jumping between two gates.
+        2. If arena guidance is enabled, prefer the candidate whose image bearing
+           points toward the expected gate slice.
+        3. Otherwise choose a conservative image score: large and near centre.
+        """
+        if not raw_det.get("found", False):
+            self._selection_debug = "none"
+            return raw_det
+
+        candidates = list(raw_det.get("candidates", []))
+        if not candidates:
+            self._selection_debug = "none"
+            return raw_det
+
+        best = None
+        best_score = -1e9
+        reason = "fallback"
+
+        # 1) Locked candidate tracking.
+        if self._gate_lock is not None:
+            lock_p = np.array([self._gate_lock["norm_x"], self._gate_lock["norm_y"]], dtype=float)
+            lock_area = max(float(self._gate_lock.get("area", 1.0)), 1.0)
+
+            for cand in candidates:
+                p = self._candidate_norm(cand)
+                jump = float(np.linalg.norm(p - lock_p))
+                area_ratio = max(float(cand["area"]), 1.0) / lock_area
+                area_err = abs(np.log(max(area_ratio, 1e-4)))
+                score = -3.0 * jump - 0.65 * area_err - 0.20 * abs(p[0]) - 0.10 * abs(p[1])
+
+                if score > best_score:
+                    best_score = score
+                    best = cand
+                    reason = f"lock jump={jump:.2f} areaerr={area_err:.2f}"
+
+            # If every candidate is a huge jump away from the locked one, treat
+            # it as lost instead of jumping to the other visible gate.
+            if best is not None:
+                p_best = self._candidate_norm(best)
+                jump_best = float(np.linalg.norm(p_best - lock_p))
+                area_ratio = max(float(best["area"]), 1.0) / lock_area
+                area_err = abs(np.log(max(area_ratio, 1e-4)))
+                if jump_best > IMAGE_LOCK_MAX_JUMP and area_err > LOCK_AREA_LOG_TOL:
+                    lost = dict(raw_det)
+                    lost["found"] = False
+                    lost["selection_reason"] = "locked gate lost; rejecting jump"
+                    self._selection_debug = lost["selection_reason"]
+                    return lost
+
+        # 2) Arena bearing score if no valid lock.
+        if best is None and USE_ARENA_GUIDANCE:
+            with self._pos_lock:
+                est = dict(self._est)
+            expected_bearing = self._expected_world_bearing(est)
+
+            for cand in candidates:
+                p = self._candidate_norm(cand)
+                cand_bearing = self._candidate_world_bearing(cand, est)
+                bearing_err = abs(self._wrap_to_pi(cand_bearing - expected_bearing))
+                area_frac = float(cand["area"]) / max(float(IMG_WIDTH * IMG_HEIGHT), 1.0)
+
+                # Prefer expected slice, then centre, then size. This avoids the
+                # old "rightmost wins" behavior when two gates are visible.
+                score = -2.2 * bearing_err - 0.45 * abs(p[0]) - 0.20 * abs(p[1]) + 3.0 * area_frac
+
+                if score > best_score:
+                    best_score = score
+                    best = cand
+                    reason = (
+                        f"arena slice={self._expected_gate_slice()} "
+                        f"bearing_err={np.rad2deg(bearing_err):.1f}deg"
+                    )
+
+        # 3) Conservative fallback: large, but not too far from image centre.
+        if best is None:
+            for cand in candidates:
+                p = self._candidate_norm(cand)
+                area_frac = float(cand["area"]) / max(float(IMG_WIDTH * IMG_HEIGHT), 1.0)
+                score = 4.0 * area_frac - 0.70 * abs(p[0]) - 0.35 * abs(p[1])
+                if score > best_score:
+                    best_score = score
+                    best = cand
+                    reason = "image fallback"
+
+        if best is None:
+            self._selection_debug = "none"
+            return raw_det
+
+        selected = dict(best)
+        selected["found"] = True
+        selected["mask"] = raw_det.get("mask")
+        selected["candidates"] = candidates
+        selected["n_candidates"] = len(candidates)
+        selected["selection_score"] = float(best_score)
+        selected["selection_reason"] = reason
+
+        p = self._candidate_norm(selected)
+        self._gate_lock = {
+            "norm_x": float(p[0]),
+            "norm_y": float(p[1]),
+            "area": float(selected.get("area", 0.0)),
+            "t": time.monotonic(),
+        }
+        self._selection_debug = reason
+        return selected
+
+    def _gate_estimate_allowed_by_arena(self, gate):
+        if not USE_ARENA_GUIDANCE:
+            return True, "arena disabled"
+
+        gate_index_1based = self._expected_gate_index() + 1
+
+        # Preferred validation from gate_map.py: check whether the triangulated
+        # point is inside the expected gate zone, with the accept margin defined
+        # in gate_map.py. This avoids using simulation-only assumptions.
+        if self._zone_map is not None:
+            snapped = self._zone_map.validate_and_snap(tuple(gate[:3]), gate_index_1based)
+            err = self._zone_map.bearing_error_deg(gate[0], gate[1], gate_index_1based)
+            real = self._zone_map.real_gate(gate_index_1based)
+            msg = (
+                f"gate_map gate={gate_index_1based}, "
+                f"zone={self._zone_map.gate_zone(gate_index_1based)}, "
+                f"bearing_err={err:.1f}deg"
+            )
+            if real is not None:
+                msg += f", real=({real[0]:.2f},{real[1]:.2f},{real[2]:.2f})"
+            return snapped is not None, msg
+
+        # Fallback validation with this script's simple slice convention.
+        s = self._slice_idx(gate[0], gate[1])
+        ok, expected, diff = self._slice_is_allowed(s)
+        if ok:
+            return True, f"slice {s}, expected {expected}, diff {diff}"
+        return False, f"slice {s}, expected {expected}, diff {diff}"
+
+    def _reset_gate_lock(self):
+        self._gate_lock = None
+        self._selection_debug = "none"
+
+    def _draw_arena_map(self):
+        size = 360
+        img = np.full((size, size, 3), 245, dtype=np.uint8)
+        c = np.array([size // 2, size // 2], dtype=float)
+
+        with self._pos_lock:
+            est = dict(self._est)
+        drone_xy = np.array([float(est["x"]), float(est["y"])], dtype=float)
+
+        # ------------------------------------------------------------------
+        # Mode A: calibrated arena/slice visualization.
+        # Use only if the real arena center/radius/slices were calibrated.
+        # ------------------------------------------------------------------
+        if USE_ARENA_GUIDANCE:
+            margin = 0.55
+            scale = size / (2.0 * (self._track_radius_dynamic + margin))
+
+            def world_to_pix(xy):
+                xy = np.asarray(xy, dtype=float)
+                d = xy - self._arena_center
+                return np.array([c[0] + d[0] * scale, c[1] - d[1] * scale], dtype=int)
+
+            cv2.circle(img, tuple(c.astype(int)), int(self._track_radius_dynamic * scale), (180, 180, 180), 1)
+            for s in range(NUM_SLICES):
+                p = self._point_at_slice_center(s, radius=self._track_radius_dynamic + 0.20)[:2]
+                cv2.line(img, tuple(c.astype(int)), tuple(world_to_pix(p)), (220, 220, 220), 1)
+
+            expected = self._expected_gate_slice()
+            exp_p = self._point_at_slice_center(expected, radius=self._track_radius_dynamic + 0.30)[:2]
+            cv2.line(img, tuple(c.astype(int)), tuple(world_to_pix(exp_p)), (0, 140, 255), 2)
+            target_gate = self._expected_gate_index() + 1
+            cv2.putText(img, f"gate_map arena | target G{target_gate} slice {expected}", (8, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 80, 160), 1)
+
+            # Real gate coordinates from gates_xyz.py, if loaded by gate_map.py.
+            for gate_idx, gate_row in self._real_gates.items():
+                gx, gy, gz, *_rest = gate_row
+                gp = world_to_pix([gx, gy])
+                is_target = (gate_idx == target_gate)
+                color = (0, 170, 0) if is_target else (70, 170, 70)
+                cv2.rectangle(img, (gp[0]-6, gp[1]-6), (gp[0]+6, gp[1]+6), color, 2)
+                cv2.putText(img, f"G{gate_idx}", (gp[0] + 8, gp[1] - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+        # ------------------------------------------------------------------
+        # Mode B: physical estimator visualization without arena assumptions.
+        # This is the safer default for the real drone.
+        # ------------------------------------------------------------------
+        else:
+            points = [drone_xy]
+            for p in self._drone_trail[-MAP_TRAIL_LEN:]:
+                points.append(np.asarray(p, dtype=float))
+            for g in self._saved_gates:
+                if g is not None:
+                    points.append(np.asarray(g[:2], dtype=float))
+            if self._last_tri_gate is not None:
+                points.append(np.asarray(self._last_tri_gate[:2], dtype=float))
+
+            pts = np.vstack(points)
+            mn = pts.min(axis=0)
+            mx = pts.max(axis=0)
+            center_xy = 0.5 * (mn + mx)
+            span = float(max(mx[0] - mn[0], mx[1] - mn[1], MAP_MIN_WINDOW_M)) + MAP_MARGIN_M
+            scale = size / span
+
+            def world_to_pix(xy):
+                xy = np.asarray(xy, dtype=float)
+                d = xy - center_xy
+                return np.array([c[0] + d[0] * scale, c[1] - d[1] * scale], dtype=int)
+
+            # Meter grid in the actual estimator x/y frame.
+            grid_step = 0.50
+            x0 = np.floor((center_xy[0] - span / 2.0) / grid_step) * grid_step
+            x1 = np.ceil((center_xy[0] + span / 2.0) / grid_step) * grid_step
+            y0 = np.floor((center_xy[1] - span / 2.0) / grid_step) * grid_step
+            y1 = np.ceil((center_xy[1] + span / 2.0) / grid_step) * grid_step
+            x = x0
+            while x <= x1 + 1e-6:
+                p0 = world_to_pix([x, y0])
+                p1 = world_to_pix([x, y1])
+                cv2.line(img, tuple(p0), tuple(p1), (225, 225, 225), 1)
+                x += grid_step
+            y = y0
+            while y <= y1 + 1e-6:
+                p0 = world_to_pix([x0, y])
+                p1 = world_to_pix([x1, y])
+                cv2.line(img, tuple(p0), tuple(p1), (225, 225, 225), 1)
+                y += grid_step
+
+            cv2.putText(img, "PHYSICAL x/y map | arena guidance OFF", (8, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 80, 160), 1)
+            cv2.putText(img, f"x={drone_xy[0]:+.2f} y={drone_xy[1]:+.2f} z={est['z']:+.2f}", (8, 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (40, 40, 40), 1)
+
+        # Trail.
+        if len(self._drone_trail) >= 2:
+            trail = self._drone_trail[-MAP_TRAIL_LEN:]
+            for a, b in zip(trail[:-1], trail[1:]):
+                cv2.line(img, tuple(world_to_pix(a)), tuple(world_to_pix(b)), (170, 170, 170), 1)
+
+        # Saved/triangulated gates.
+        for i, g in enumerate(self._saved_gates):
+            if g is None:
+                continue
+            pp = world_to_pix(np.asarray(g[:2]))
+            cv2.circle(img, tuple(pp), 5, (0, 120, 0), -1)
+            cv2.putText(img, str(i + 1), (pp[0] + 6, pp[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 120, 0), 1)
+
+        if self._last_tri_gate is not None:
+            pp = world_to_pix(np.asarray(self._last_tri_gate[:2]))
+            cv2.circle(img, tuple(pp), 6, (255, 0, 0), 2)
+            cv2.putText(img, "tri", (pp[0] + 6, pp[1] + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 0, 0), 1)
+
+        # Drone estimate and yaw arrow.
+        dp = world_to_pix(drone_xy)
+        cv2.circle(img, tuple(dp), 5, (0, 0, 255), -1)
+        yaw = np.deg2rad(float(est["yaw"]))
+        tip = dp + np.array([np.cos(yaw), -np.sin(yaw)]) * 22
+        cv2.arrowedLine(img, tuple(dp), tuple(tip.astype(int)), (0, 0, 255), 2, tipLength=0.35)
+
+        cv2.putText(
+            img,
+            f"state={self._state} gate={self._gates_passed + 1}/{MAX_GATES}",
+            (8, size - 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (30, 30, 30),
+            1,
+        )
+        cv2.putText(
+            img,
+            f"select: {self._selection_debug[:35]}",
+            (8, size - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.38,
+            (30, 30, 30),
+            1,
+        )
+
+        h, w, ch = img.shape
+        q = QtGui.QImage(img.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888)
+        self.map_label.setPixmap(QtGui.QPixmap.fromImage(q))
+
     def _update_image(self, img):
         if img.ndim == 2:
             color = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
@@ -594,7 +1068,8 @@ class FPVWindow(QtWidgets.QWidget):
             color = img
 
         color = _undistort_image(color)
-        det = _detect_green_gate(color)
+        raw_det = _detect_green_gate(color)
+        det = self._select_gate_with_context(raw_det)
 
         now = time.monotonic()
         found = bool(det.get("found", False))
@@ -619,6 +1094,8 @@ class FPVWindow(QtWidgets.QWidget):
                     "cx": float(det.get("cx", 0.0)),
                     "cy": float(det.get("cy", 0.0)),
                     "corners": corners,
+                    "selection": det.get("selection_reason", self._selection_debug),
+                    "n_candidates": int(det.get("n_candidates", 0)),
                 },
                 "drone": {
                     "x": float(est.get("x", 0.0)),
@@ -664,14 +1141,17 @@ class FPVWindow(QtWidgets.QWidget):
         h, w = disp.shape[:2]
         cv2.drawMarker(disp, (w // 2, h // 2), (255, 255, 255), cv2.MARKER_CROSS, 12, 1)
 
-        text1 = f"state={self._state} gate={self._gates_passed + 1}/{MAX_GATES} found={int(det.get('found', False))}"
+        text1 = f"state={self._state} gate={self._gates_passed + 1}/{MAX_GATES} found={int(det.get('found', False))} cand={det.get('n_candidates', 0)}"
         text2 = f"ex={det.get('ex', 0.0):+.2f} ey={det.get('ey', 0.0):+.2f} area={det.get('area', 0.0)/(IMG_WIDTH*IMG_HEIGHT):.3f}"
+        text3 = f"select={det.get('selection_reason', self._selection_debug)[:48]}"
         cv2.putText(disp, text1, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(disp, text2, (6, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(disp, text3, (6, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
 
         h, w, ch = disp.shape
         q = QtGui.QImage(disp.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888)
         self.image_label.setPixmap(QtGui.QPixmap.fromImage(q.scaled(w * 2, h * 2)))
+        self._draw_arena_map()
 
     # ------------------------------------------------------------------
     # Main state machine
@@ -724,6 +1204,7 @@ class FPVWindow(QtWidgets.QWidget):
         if self._state == "ACQUIRE":
             if not vision["recent"]:
                 if now - self._state_t0 > ACQUIRE_TIMEOUT_S:
+                    self._reset_gate_lock()
                     self._change_state("SCAN")
                 self._send_hover(0.0, 0.0, SEARCH_YAWRATE * 0.5, self._height_cmd)
                 self._status("ACQUIRE: lost candidate, slowly scanning")
@@ -761,6 +1242,7 @@ class FPVWindow(QtWidgets.QWidget):
                 if now - self._last_seen_t > LOST_TO_SCAN_S:
                     self._reset_detection_memory()
                     self._reset_tri_memory()
+                    self._reset_gate_lock()
                     self._change_state("SCAN")
                 self._send_hover(0.0, 0.0, SEARCH_YAWRATE * 0.25, self._height_cmd)
                 self._status("TRIANGULATE: lost gate, stopping")
@@ -777,12 +1259,29 @@ class FPVWindow(QtWidgets.QWidget):
 
             gate, residual = self._triangulate_gate_center()
             if gate is not None:
+                ok, arena_msg = self._gate_estimate_allowed_by_arena(gate)
+                if not ok:
+                    print(
+                        f"[TRI-REJECT] gate {self._gates_passed + 1}: "
+                        f"x={gate[0]:.2f}, y={gate[1]:.2f}, z={gate[2]:.2f}, "
+                        f"residual={residual:.3f} m, {arena_msg}",
+                        flush=True,
+                    )
+                    # Likely the other visible gate. Clear lock and scan again
+                    # instead of approaching the wrong target.
+                    self._reset_detection_memory()
+                    self._reset_tri_memory()
+                    self._reset_gate_lock()
+                    self._change_state("SCAN")
+                    return
+
                 self._last_tri_gate = gate
                 self._last_tri_residual = residual
+                self._saved_gates[self._expected_gate_index()] = gate.copy()
                 print(
                     f"[TRI] gate {self._gates_passed + 1}: "
                     f"x={gate[0]:.2f}, y={gate[1]:.2f}, z={gate[2]:.2f}, "
-                    f"obs={len(self._tri_obs)}, residual={residual:.3f} m",
+                    f"obs={len(self._tri_obs)}, residual={residual:.3f} m, {arena_msg}",
                     flush=True,
                 )
                 self._change_state("APPROACH")
@@ -808,6 +1307,7 @@ class FPVWindow(QtWidgets.QWidget):
                 # Safer behavior: do not continue forward blindly.
                 if now - self._last_seen_t > LOST_TO_SCAN_S:
                     self._reset_detection_memory()
+                    self._reset_gate_lock()
                     self._change_state("SCAN")
                 self._send_hover(0.0, 0.0, SEARCH_YAWRATE * 0.3, self._height_cmd)
                 self._status("APPROACH: lost gate, stopping forward motion")
@@ -853,6 +1353,7 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gates_passed += 1
                 self._reset_detection_memory()
                 self._reset_tri_memory()
+                self._reset_gate_lock()
 
                 if self._gates_passed >= MAX_GATES:
                     self._change_state("DONE")
@@ -897,7 +1398,7 @@ class FPVWindow(QtWidgets.QWidget):
                 self._area_f = area
                 self._filter_initialized = True
             else:
-                alpha = 0.35
+                alpha = VISION_ALPHA
                 self._ex_f = (1.0 - alpha) * self._ex_f + alpha * ex
                 self._ey_f = (1.0 - alpha) * self._ey_f + alpha * ey
                 self._area_f = (1.0 - alpha) * self._area_f + alpha * area
@@ -1023,12 +1524,31 @@ class FPVWindow(QtWidgets.QWidget):
     def _is_centered(self, vision, tol_x, tol_y):
         return abs(vision["ex"]) <= tol_x and abs(vision["ey"]) <= tol_y
 
+    def _rate_limit(self, target, previous, max_rate, dt):
+        return _clip_float(target, previous - max_rate * dt, previous + max_rate * dt)
+
     def _send_hover(self, vx, vy, yawrate, z):
         z = _clip_float(z, MIN_HEIGHT, MAX_HEIGHT)
-        vx = _clip_float(vx, -0.35, 0.45)
-        vy = _clip_float(vy, -0.25, 0.25)
+        vx = _clip_float(vx, -0.25, 0.30)
+        vy = _clip_float(vy, -0.14, 0.14)
         yawrate = _clip_float(yawrate, -MAX_YAWRATE, MAX_YAWRATE)
-        self.cf.commander.send_hover_setpoint(vx, vy, yawrate, z)
+
+        now = time.monotonic()
+        dt = _clip_float(now - self._last_cmd.get("t", now), 0.02, 0.20)
+
+        vx = self._rate_limit(vx, self._last_cmd["vx"], MAX_DVX_PER_S, dt)
+        vy = self._rate_limit(vy, self._last_cmd["vy"], MAX_DVY_PER_S, dt)
+        yawrate = self._rate_limit(yawrate, self._last_cmd["yawrate"], MAX_DYAWRATE_PER_S, dt)
+        z = self._rate_limit(z, self._last_cmd["z"], MAX_DZCMD_PER_S, dt)
+
+        # Final low-pass. This is what makes the drone much less twitchy.
+        vx = (1.0 - CMD_ALPHA) * self._last_cmd["vx"] + CMD_ALPHA * vx
+        vy = (1.0 - CMD_ALPHA) * self._last_cmd["vy"] + CMD_ALPHA * vy
+        yawrate = (1.0 - CMD_ALPHA) * self._last_cmd["yawrate"] + CMD_ALPHA * yawrate
+        z = (1.0 - CMD_ALPHA) * self._last_cmd["z"] + CMD_ALPHA * z
+
+        self._last_cmd = {"vx": float(vx), "vy": float(vy), "yawrate": float(yawrate), "z": float(z), "t": now}
+        self.cf.commander.send_hover_setpoint(float(vx), float(vy), float(yawrate), float(z))
 
     def _change_state(self, new_state):
         if new_state != self._state:
@@ -1107,6 +1627,12 @@ class FPVWindow(QtWidgets.QWidget):
             self._est["y"] = data["stateEstimate.y"]
             self._est["z"] = data["stateEstimate.z"]
             self._est["yaw"] = data["stabilizer.yaw"]
+
+            p = np.array([self._est["x"], self._est["y"]], dtype=float)
+            if not self._drone_trail or np.linalg.norm(p - np.asarray(self._drone_trail[-1])) > 0.02:
+                self._drone_trail.append(p)
+                if len(self._drone_trail) > MAP_TRAIL_LEN:
+                    self._drone_trail = self._drone_trail[-MAP_TRAIL_LEN:]
 
             if not self._log_ready:
                 self._height_cmd = _clip_float(max(self._est["z"], TAKEOFF_START_HEIGHT), MIN_HEIGHT, SEARCH_HEIGHT)
