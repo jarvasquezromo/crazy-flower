@@ -213,6 +213,11 @@ GATE_MIN_SOLIDITY = 0.80   # area / convex-hull area: frame outline is near-conv
 GATE_APPROX_EPS   = 0.04   # approxPolyDP epsilon, fraction of perimeter
 
 # --- Camera / world-frame projection (zone validation + map only) ---
+REQUIRE_GATE_ZONE = False             # if False, skip the zone validate_and_snap check
+                                     # everywhere: SEARCH locks onto ANY detected gate
+                                     # and CHASE tracks the detection directly (no world
+                                     # projection required). Debug / fallback when the
+                                     # zone snap never passes.
 DEBUG_GATE_POSE = True               # print per-stage gate pose values for debugging
 DEBUG_CALIB     = True               # print per-detection calibration numbers (area %, ex/ey, ...)
 GATE_PHYS_H    = 0.4                 # metres, physical gate height — the only fixed dimension
@@ -225,7 +230,7 @@ VISION_STALE_S = 0.5                 # s; treat the video feed as lost if no new
                                      # arrives within this window (avoids servoing /
                                      # committing on a frozen image)
 CHASE_TIMEOUT  = 8.0                 # seconds before giving up and returning to SEARCH
-SEARCH_CONFIRM_FRAMES = 10            # consecutive in-zone detections required before
+SEARCH_CONFIRM_FRAMES = 1           # consecutive in-zone detections required before
                                      # locking on (their snapped positions are averaged)
                                      
 @contextlib.contextmanager
@@ -760,25 +765,41 @@ class FPVWindow(QtWidgets.QWidget):
             # must count distinct frames, and averaging repeated frames would bias
             # the locked position.
             if new_frame:
+                gate_idx = self._gates_passed + 1
+                gw = None
                 snapped = None
                 if found and bbox is not None:
                     gw = self._gate_to_world(corners)
                     if gw is not None:
-                        gate_idx = self._gates_passed + 1
-                        snapped = self._zone_map.validate_and_snap(gw, gate_idx)
                         self._last_est_gate = gw
-                        self._last_est_in_zone = snapped is not None
+                        if REQUIRE_GATE_ZONE:
+                            snapped = self._zone_map.validate_and_snap(gw, gate_idx)
+                            self._last_est_in_zone = snapped is not None
 
-                # Require SEARCH_CONFIRM_FRAMES *consecutive* in-zone detections,
-                # then lock on their average — rejects one-off noisy/false
-                # estimates. Any miss (no gate, bad geometry, out of zone) resets
-                # the streak.
-                if snapped is not None:
-                    self._search_confirm.append(snapped)
+                if REQUIRE_GATE_ZONE:
+                    # Accept only in-zone detections (snapped position known).
+                    accept = snapped is not None
+                    confirm_pos = snapped
+                else:
+                    # Zone check disabled: accept ANY detection this frame, even
+                    # with no usable world projection (confirm_pos may be None).
+                    accept = found and bbox is not None
+                    confirm_pos = gw
+                    self._last_est_in_zone = None
+
+                # Require SEARCH_CONFIRM_FRAMES *consecutive* accepted detections,
+                # then lock on the average of the world estimates collected (any
+                # miss resets the streak). With the zone check off there may be no
+                # world estimates at all, in which case _gate_world stays None.
+                if accept:
+                    self._search_confirm.append(confirm_pos)
                     if len(self._search_confirm) >= SEARCH_CONFIRM_FRAMES:
-                        avg = tuple(np.mean(np.asarray(self._search_confirm, dtype=np.float64), axis=0))
+                        pts = [p for p in self._search_confirm if p is not None]
+                        self._gate_world = (
+                            tuple(np.mean(np.asarray(pts, dtype=np.float64), axis=0))
+                            if pts else None
+                        )
                         self._search_confirm = []
-                        self._gate_world = avg
                         self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
                         self._chase_best_area_frac = 0.0
                         self._chase_area_stall = 0
@@ -1152,7 +1173,17 @@ class FPVWindow(QtWidgets.QWidget):
         tracking the single gate we committed to and ignores gates from other
         zones that wander into the frame. Returns ``(candidate, snapped_xyz)``
         or ``None`` if no candidate falls in the zone.
+
+        With ``REQUIRE_GATE_ZONE`` off the zone check is skipped entirely: the
+        rightmost candidate (the detector's own selection policy) is returned,
+        paired with its raw world projection (or None) for the map.
         """
+        if not REQUIRE_GATE_ZONE:
+            if not candidates:
+                return None
+            c = max(candidates, key=lambda cc: cc["cx"])
+            return (c, self._gate_to_world(c.get("corners"), verbose=False))
+
         best = None
         best_d = float('inf')
         locked = self._gate_world
