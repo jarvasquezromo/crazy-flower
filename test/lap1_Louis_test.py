@@ -46,7 +46,6 @@ Set the radio URI via the CRAZYFLIE_URI env var (default radio://0/70/2M/...).
 """
 
 import contextlib
-import json
 import logging
 import os
 import socket
@@ -81,84 +80,18 @@ CPX_HEADER_SIZE = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE = 11
 MIN_JPEG_BYTES = 5000
-CALIBRATION_PATH = os.path.join(os.path.dirname(__file__), "calibration.json")
+DEFAULT_IMG_W = 324
+DEFAULT_IMG_H = 244
+CAMERA_FOV_RAD = 1.5
+IMG_WIDTH = DEFAULT_IMG_W
+IMG_HEIGHT = DEFAULT_IMG_H
 
 
-def _load_calibration():
-    with open(CALIBRATION_PATH, "r", encoding="utf-8") as f:
-        calib = json.load(f)
-    required = ("img_w", "img_h", "fx", "fy", "cx", "cy", "dist_coeffs")
-    missing = [key for key in required if key not in calib]
-    if missing:
-        raise ValueError(f"Missing calibration keys in {CALIBRATION_PATH}: {missing}")
-    return calib
-
-
-def _scaled_calibration(calib, img_w, img_h):
-    sx = float(img_w) / float(calib["img_w"])
-    sy = float(img_h) / float(calib["img_h"])
-    scaled = dict(calib)
-    scaled["img_w"] = int(img_w)
-    scaled["img_h"] = int(img_h)
-    scaled["fx"] = float(calib["fx"]) * sx
-    scaled["fy"] = float(calib["fy"]) * sy
-    scaled["cx"] = float(calib["cx"]) * sx
-    scaled["cy"] = float(calib["cy"]) * sy
-    scaled["fov_h_deg"] = float(
-        np.degrees(2.0 * np.arctan(img_w / (2.0 * scaled["fx"])))
-    )
-    scaled["fov_v_deg"] = float(
-        np.degrees(2.0 * np.arctan(img_h / (2.0 * scaled["fy"])))
-    )
-    return scaled
-
-
-BASE_CALIBRATION = _load_calibration()
-CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
-IMG_WIDTH = int(CAMERA_CALIBRATION["img_w"])
-IMG_HEIGHT = int(CAMERA_CALIBRATION["img_h"])
-CAMERA_FX = float(CAMERA_CALIBRATION["fx"])
-CAMERA_FY = float(CAMERA_CALIBRATION["fy"])
-CAMERA_CX = float(CAMERA_CALIBRATION["cx"])
-CAMERA_CY = float(CAMERA_CALIBRATION["cy"])
-DIST_COEFFS = np.array(CAMERA_CALIBRATION["dist_coeffs"], dtype=np.float64)
-
-
-def _set_runtime_calibration(img_w, img_h):
-    global CAMERA_CALIBRATION, IMG_WIDTH, IMG_HEIGHT, CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY, DIST_COEFFS
-
-    if img_w == int(BASE_CALIBRATION["img_w"]) and img_h == int(
-        BASE_CALIBRATION["img_h"]
-    ):
-        CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
-        print(f"Radio image size OK: {img_w}x{img_h} matches calibration.json")
-    else:
-        CAMERA_CALIBRATION = _scaled_calibration(BASE_CALIBRATION, img_w, img_h)
-        print(
-            f"Radio image size {img_w}x{img_h} differs from calibration.json "
-            f"{BASE_CALIBRATION['img_w']}x{BASE_CALIBRATION['img_h']}; scaled calibration in memory"
-        )
-
-    IMG_WIDTH = int(CAMERA_CALIBRATION["img_w"])
-    IMG_HEIGHT = int(CAMERA_CALIBRATION["img_h"])
-    CAMERA_FX = float(CAMERA_CALIBRATION["fx"])
-    CAMERA_FY = float(CAMERA_CALIBRATION["fy"])
-    CAMERA_CX = float(CAMERA_CALIBRATION["cx"])
-    CAMERA_CY = float(CAMERA_CALIBRATION["cy"])
-    DIST_COEFFS = np.array(CAMERA_CALIBRATION["dist_coeffs"], dtype=np.float64)
-
-
-def _camera_matrix():
-    return np.array(
-        [[CAMERA_FX, 0.0, CAMERA_CX], [0.0, CAMERA_FY, CAMERA_CY], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
-
-
-def _undistort_image(rgb_img):
-    if DIST_COEFFS.size == 0 or np.allclose(DIST_COEFFS, 0.0):
-        return rgb_img
-    return cv2.undistort(rgb_img, _camera_matrix(), DIST_COEFFS)
+def _set_runtime_image_size(img_w, img_h):
+    global IMG_WIDTH, IMG_HEIGHT
+    IMG_WIDTH = int(img_w)
+    IMG_HEIGHT = int(img_h)
+    print(f"Radio image size: {IMG_WIDTH}x{IMG_HEIGHT}")
 
 
 # --- Gate detection / control tuning ---
@@ -367,14 +300,16 @@ def _quat_to_rot(qx, qy, qz, qw):
     )
 
 
-def _pixel_ray_body(u, v):
+def _pixel_ray_body(u, v, img_w, img_h, fov=CAMERA_FOV_RAD):
     """Unit viewing ray (body frame) for image pixel (u, v).
 
-    Body frame: x forward (optical axis), y left, z up. Uses the calibrated
-    intrinsics rather than a single fov-derived focal length.
+    Body frame: x forward (optical axis), y left, z up. Uses a fov-derived
+    focal length with the image center as the principal point.
     """
-    x_img = (u - CAMERA_CX) / CAMERA_FX
-    y_img = (v - CAMERA_CY) / CAMERA_FY
+    cx, cy = float(img_w) / 2.0, float(img_h) / 2.0
+    f = (float(img_w) / 2.0) / np.tan(fov / 2.0)
+    x_img = (u - cx) / f
+    y_img = (v - cy) / f
     ray = np.array([1.0, -x_img, -y_img], dtype=np.float64)
     return ray / np.linalg.norm(ray)
 
@@ -443,8 +378,8 @@ def _gate_candidate(cnt, img_w, img_h):
         cx = float(m["m10"] / m["m00"])
         cy = float(m["m01"] / m["m00"])
 
-    ex = (cx - CAMERA_CX) / max(0.5 * img_w, 1.0)
-    ey = (cy - CAMERA_CY) / max(0.5 * img_h, 1.0)
+    ex = (cx - 0.5 * img_w) / max(0.5 * img_w, 1.0)
+    ey = (cy - 0.5 * img_h) / max(0.5 * img_h, 1.0)
 
     return {
         "found": True,
@@ -529,7 +464,7 @@ class UdpVideoThread(QtCore.QThread):
                     self._expected_w = int(w)
                     self._expected_h = int(h)
                     if not self._printed_size:
-                        _set_runtime_calibration(self._expected_w, self._expected_h)
+                        _set_runtime_image_size(self._expected_w, self._expected_h)
                         self._printed_size = True
                     expected_size = size
                     buffer = bytearray()
@@ -675,8 +610,6 @@ class FPVWindow(QtWidgets.QWidget):
             color = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         else:
             color = img
-        color = _undistort_image(color)
-
         det = _detect_green_gate(color)
         self._vision_seq += 1
         with self._vision_lock:
@@ -1335,7 +1268,7 @@ class FPVWindow(QtWidgets.QWidget):
 
         Used ONLY for the zone validation/snap and the top-down map — the drone
         is never commanded toward this point (steering is purely visual). Each
-        corner is back-projected to a viewing ray (calibrated intrinsics),
+        corner is back-projected to a viewing ray (FOV-based intrinsics),
         rotated into the world with the drone's full attitude quaternion (so
         camera pitch/roll are handled, not just yaw), and metric depth is
         recovered by enforcing that each vertical gate edge is a vertical
@@ -1364,7 +1297,7 @@ class FPVWindow(QtWidgets.QWidget):
         # Viewing rays for TL, TR, BR, BL in the world frame.
         rays = []
         for u, v in c:
-            rw = rot @ _pixel_ray_body(u, v)
+            rw = rot @ _pixel_ray_body(u, v, IMG_WIDTH, IMG_HEIGHT)
             rays.append(rw / np.linalg.norm(rw))
         r_tl, r_tr, r_br, r_bl = rays
 

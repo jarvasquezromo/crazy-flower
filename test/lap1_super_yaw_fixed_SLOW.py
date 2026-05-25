@@ -199,7 +199,7 @@ class Surveyer:
 
         return {"cx": cx, "cy": cy, "corners": corners}
 
-    def _detect_gate_outline(self, camera_data):
+    def _detect_gate_candidates(self, camera_data):
         h, w = camera_data.shape[:2]
         gray = cv2.cvtColor(camera_data, cv2.COLOR_BGR2GRAY)
         mask = np.where(gray >= int(MIN_GATE_V), np.uint8(255), np.uint8(0))
@@ -211,10 +211,12 @@ class Surveyer:
             cand = self._gate_candidate(contour, w, h)
             if cand is not None:
                 candidates.append(cand)
+        return candidates
 
+    def _detect_gate_outline(self, camera_data):
+        candidates = self._detect_gate_candidates(camera_data)
         if not candidates:
             return None
-
         return max(candidates, key=lambda c: c["cx"])
 
     def pixels_to_world(self, pixels, cam_pos, cam_rot, img_shape, fov=1.5, real_height=0.4):
@@ -312,7 +314,7 @@ class Surveyer:
         target_x = COURSE_CENTER_X + np.cos(angle) * radius
         target_z = 1.1
         # Internal geometry is in radians, but Crazyflie position-setpoint yaw is degrees.
-        target_yaw_rad = -angle + np.pi / 2 + np.pi / 6 + np.pi / 12
+        target_yaw_rad = angle + np.pi / 2 + np.pi / 6 + np.pi / 12
 
         target_z += self.height_offset
         target_yaw_rad += self.angle_offset
@@ -322,9 +324,8 @@ class Surveyer:
 
     def _advance_mapping_radius(self):
         self.mapping_radius_idx = (self.mapping_radius_idx + 1) % len(self.mapping_radii)
-        # Keep search deterministic and stable during hardware testing.
-        self.height_offset = 0.0
-        self.angle_offset = 0.0
+        self.height_offset = np.random.uniform(-0.2, 0.2)
+        self.angle_offset = np.random.uniform(-np.pi / 12, np.pi / 12)
 
     @staticmethod
     def segment_from_xy(x, y, center_x=COURSE_CENTER_X, center_y=COURSE_CENTER_Y):
@@ -393,35 +394,18 @@ class Surveyer:
                 self._reset_stabilization()
                 self._last_mapping_key = mapping_key
             if self._stable_at_target(sensor_data, control_command, (gate_id, self.mapping_progress, self.mapping_radius_idx)) and self.acquire_gate(sensor_data, camera_data):
-                observed_segment = self.segment_from_xy(self.gate_center[0], self.gate_center[1])
-
+                center = np.asarray(self.gate_center, dtype=float)
+                observed_segment = self.segment_from_xy(center[0], center[1])
                 if observed_segment == gate_id:
-                    self.mapping_progress += 1
-                    self._hold_context = None
+                    self.gates += [[center[0], center[1], center[2]]]
+                    self.record_gate_observation(observed_segment, center, self.heading)
+                    self.mapping_progress = 2
                 else:
                     self.gate_center = None
                     self._advance_mapping_radius()
-                    self._hold_context = None
-
-                self._reset_stabilization()
-            elif self._hold_elapsed(sensor_data, (gate_id, self.mapping_progress, self.mapping_radius_idx), 10.0):
-                self._advance_mapping_radius()
-                self._reset_stabilization()
                 self._hold_context = None
-
-        elif self.mapping_progress == 1:
-            control_command = self.fly_before_gate()
-            if self._stable_at_target(sensor_data, control_command, (gate_id, self.mapping_progress)) and self.acquire_gate(sensor_data, camera_data, check=True):
-                center = np.asarray(self.gate_center, dtype=float)
-                self.gates += [[center[0], center[1], center[2]]]
-                observed_segment = self.segment_from_xy(center[0], center[1])
-                self.record_gate_observation(observed_segment, center, self.heading)
-                self.mapping_progress += 1
                 self._reset_stabilization()
-                self._hold_context = None
-            elif self._hold_elapsed(sensor_data, (gate_id, self.mapping_progress), 10.0):
-                self.mapping_progress = 0
-                self.gate_center = None
+            elif self._hold_elapsed(sensor_data, (gate_id, self.mapping_progress, self.mapping_radius_idx), 5.0):
                 self._advance_mapping_radius()
                 self._reset_stabilization()
                 self._hold_context = None
@@ -560,8 +544,8 @@ class FPVWindow(QtWidgets.QWidget):
         self._cmd_pos = None
         # Speeds are true rates per second, not per 20 ms control tick.
         # The previous _xy_step=0.02 per tick was about 1.0 m/s at 50 Hz.
-        self._max_xy_speed = 0.045       # m/s, very slow horizontal motion
-        self._max_z_speed = 0.025        # m/s, very slow vertical motion
+        self._max_xy_speed = 0.25       # m/s, very slow horizontal motion
+        self._max_z_speed = 0.085        # m/s, very slow vertical motion
         self._max_yaw_rate_deg = 18.0    # deg/s, slow yaw motion
         self._ramp_target = None
         self._ramp_pos_eps = 1e-3
@@ -600,8 +584,14 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_frame = bgr
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        q = QtGui.QImage(rgb.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888).copy()
+        display = rgb.copy()
+        candidates = self._controller.surveyer._detect_gate_candidates(bgr)
+        for cand in candidates:
+            corners = np.asarray(cand.get("corners"), dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(display, [corners], True, (0, 255, 0), 2)
+
+        h, w, ch = display.shape
+        q = QtGui.QImage(display.data, w, h, w * ch, QtGui.QImage.Format.Format_RGB888).copy()
         self.image_label.setPixmap(QtGui.QPixmap.fromImage(q.scaled(w * 2, h * 2)))
 
     def _send_setpoint(self):

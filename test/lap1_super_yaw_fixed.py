@@ -312,7 +312,7 @@ class Surveyer:
         target_x = COURSE_CENTER_X + np.cos(angle) * radius
         target_z = 1.1
         # Internal geometry is in radians, but Crazyflie position-setpoint yaw is degrees.
-        target_yaw_rad = -angle + np.pi / 2 + np.pi / 6 + np.pi / 12
+        target_yaw_rad = angle + np.pi / 2 + np.pi / 6 + np.pi / 12
 
         target_z += self.height_offset
         target_yaw_rad += self.angle_offset
@@ -557,9 +557,9 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_ctrl_time = time.monotonic()
         self._log_ready = False
         self._cmd_pos = None
-        self._xy_step = 0.02
-        self._z_step = 0.01
-        self._yaw_step_deg = 5.0
+        self._xy_step = 0.01
+        self._z_step = 0.005
+        self._yaw_step_deg = 2.5
         self._ramp_target = None
         self._ramp_pos_eps = 1e-3
         self._ramp_yaw_eps = 0.5  # degrees
