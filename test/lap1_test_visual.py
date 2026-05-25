@@ -82,7 +82,6 @@ IMG_HEADER_SIZE = 11
 MIN_JPEG_BYTES = 5000
 CALIBRATION_PATH = os.path.join(os.path.dirname(__file__), 'calibration.json')
 
-
 def _load_calibration():
     with open(CALIBRATION_PATH, 'r', encoding='utf-8') as f:
         calib = json.load(f)
@@ -91,7 +90,6 @@ def _load_calibration():
     if missing:
         raise ValueError(f"Missing calibration keys in {CALIBRATION_PATH}: {missing}")
     return calib
-
 
 def _scaled_calibration(calib, img_w, img_h):
     sx = float(img_w) / float(calib['img_w'])
@@ -107,7 +105,6 @@ def _scaled_calibration(calib, img_w, img_h):
     scaled['fov_v_deg'] = float(np.degrees(2.0 * np.arctan(img_h / (2.0 * scaled['fy']))))
     return scaled
 
-
 BASE_CALIBRATION = _load_calibration()
 CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
 IMG_WIDTH = int(CAMERA_CALIBRATION['img_w'])
@@ -117,7 +114,6 @@ CAMERA_FY = float(CAMERA_CALIBRATION['fy'])
 CAMERA_CX = float(CAMERA_CALIBRATION['cx'])
 CAMERA_CY = float(CAMERA_CALIBRATION['cy'])
 DIST_COEFFS = np.array(CAMERA_CALIBRATION['dist_coeffs'], dtype=np.float64)
-
 
 def _set_runtime_calibration(img_w, img_h):
     global CAMERA_CALIBRATION, IMG_WIDTH, IMG_HEIGHT, CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY, DIST_COEFFS
@@ -140,13 +136,11 @@ def _set_runtime_calibration(img_w, img_h):
     CAMERA_CY = float(CAMERA_CALIBRATION['cy'])
     DIST_COEFFS = np.array(CAMERA_CALIBRATION['dist_coeffs'], dtype=np.float64)
 
-
 def _camera_matrix():
     return np.array(
         [[CAMERA_FX, 0.0, CAMERA_CX], [0.0, CAMERA_FY, CAMERA_CY], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
-
 
 def _undistort_image(rgb_img):
     if DIST_COEFFS.size == 0 or np.allclose(DIST_COEFFS, 0.0):
@@ -230,8 +224,7 @@ PASS_AREA_FRAC = 0.20                # gate bbox / image area threshold → gate
 CHASE_TIMEOUT  = 8.0                 # seconds before giving up and returning to SEARCH
 SEARCH_CONFIRM_FRAMES = 10            # consecutive in-zone detections required before
                                      # locking on (their snapped positions are averaged)
-
-
+                                     
 @contextlib.contextmanager
 def _muted_stderr():
     saved = os.dup(2)
@@ -825,23 +818,9 @@ class FPVWindow(QtWidgets.QWidget):
                     # --- Servo yaw + height to centre the TARGET gate ---
                     yaw_cmd = float(np.clip(-K_YAW * ex_t, -MAX_YAWRATE, MAX_YAWRATE))
                     y_cmd = float(np.clip(-K_LATERAL * ex_t, -MAX_LATERAL, MAX_LATERAL))
-                    # Height: ey > 0 means gate below image centre. We target a
-                    # small positive offset so the drone flies slightly higher
-                    # than pure image-centre alignment.
-                    ey_err = ey_t - APPROACH_TARGET_EY
-                    # Close to the gate, centre estimates get noisy because the
-                    # gate occupies many pixels; reduce z corrections there.
-                    slowdown_span = max(PASS_AREA_FRAC - HEIGHT_SLOWDOWN_AREA_FRAC, 1e-6)
-                    slowdown = float(np.clip(
-                        (area_frac - HEIGHT_SLOWDOWN_AREA_FRAC) / slowdown_span,
-                        0.0,
-                        1.0,
-                    ))
-                    height_scale = 1.0 - slowdown * (1.0 - HEIGHT_MIN_SCALE)
-                    max_dh = MAX_DH_PER_S * height_scale
-                    dh = float(np.clip(-K_HEIGHT * height_scale * ey_err, -max_dh, max_dh))
-                    self.hover['height'] = float(
-                        np.clip(self.hover['height'] + dh * dt, MIN_HEIGHT, MAX_HEIGHT))
+                    # Height: drive the gate toward APPROACH_TARGET_EY (held
+                    # slightly below image centre -> drone flies slightly higher).
+                    ey_err = self._servo_gate_height(ey_t, area_frac, dt)
 
                     centred = (abs(ex_t) <= APPROACH_TOL_X) and (abs(ey_err) <= APPROACH_TOL_Y)
 
@@ -922,6 +901,12 @@ class FPVWindow(QtWidgets.QWidget):
             # PASS_THROUGH_DIST (measured by odometry), so a slow push still
             # clears the gate. Falls back to a time limit for safety.
             x_cmd = FORWARD_SPEED
+            # Keep correcting altitude toward the gate while it is still visible:
+            # PUSH otherwise freezes the height setpoint for the whole traversal,
+            # so a commit made slightly low would be locked in. Once the gate
+            # leaves the frame (found == False) the last height simply holds.
+            if found and bbox is not None:
+                self._servo_gate_height(ey, area / img_area, dt)
             travelled = float(np.hypot(est['x'] - self._push_start[0],
                                        est['y'] - self._push_start[1]))
             if travelled >= PASS_THROUGH_DIST or (now - self._state_t0) >= PUSH_MAX_DURATION:
@@ -945,6 +930,30 @@ class FPVWindow(QtWidgets.QWidget):
         self.hover['height'] = float(np.clip(self.hover['height'], MIN_HEIGHT, MAX_HEIGHT))
         self.cf.commander.send_hover_setpoint(
             self.hover['x'], self.hover['y'], self.hover['yaw'], self.hover['height'])
+
+    def _servo_gate_height(self, ey_t, area_frac, dt):
+        """Nudge the absolute-height setpoint to hold the gate at APPROACH_TARGET_EY.
+
+        ``ey_t > 0`` means the gate sits below image centre; targeting a small
+        positive offset keeps the drone flying slightly higher than pure
+        image-centre alignment. Close to the gate the centroid gets noisy (the
+        gate fills many pixels), so the z gain and rate are scaled down. Updates
+        ``self.hover['height']`` in place and returns ``ey_err`` for the caller's
+        centred/commit logic.
+        """
+        ey_err = ey_t - APPROACH_TARGET_EY
+        slowdown_span = max(PASS_AREA_FRAC - HEIGHT_SLOWDOWN_AREA_FRAC, 1e-6)
+        slowdown = float(np.clip(
+            (area_frac - HEIGHT_SLOWDOWN_AREA_FRAC) / slowdown_span,
+            0.0,
+            1.0,
+        ))
+        height_scale = 1.0 - slowdown * (1.0 - HEIGHT_MIN_SCALE)
+        max_dh = MAX_DH_PER_S * height_scale
+        dh = float(np.clip(-K_HEIGHT * height_scale * ey_err, -max_dh, max_dh))
+        self.hover['height'] = float(
+            np.clip(self.hover['height'] + dh * dt, MIN_HEIGHT, MAX_HEIGHT))
+        return ey_err
 
     def _return_to_last_chase_gate_pose(self, est, dt):
         tx, ty, th = self._last_chase_gate_pose
