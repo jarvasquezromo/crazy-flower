@@ -595,8 +595,6 @@ class FPVWindow(QtWidgets.QWidget):
         self.video.frame_ready.connect(self._update_image)
         self.video.start()
 
-        self.cf.supervisor.send_arming_request(True)
-
         self._timer = QtCore.QTimer()
         self._timer.timeout.connect(self._send_setpoint)
         self._timer.setInterval(20)
@@ -907,6 +905,9 @@ class FPVWindow(QtWidgets.QWidget):
                         self._push_start = (est['x'], est['y'])
                         self._gate_state = "PUSH"
                         self._state_t0   = now
+                        # Commit cleanly: no residual steering on the commit tick;
+                        # the push is blind/straight from here.
+                        x_cmd = y_cmd = yaw_cmd = 0.0
                     elif centred:
                         # Aligned but not yet close: creep straight forward, slowly.
                         x_cmd = CHASE_FORWARD
@@ -1215,6 +1216,9 @@ class FPVWindow(QtWidgets.QWidget):
         # position estimate. Just start logging and take off.
         self._set_status(f'Connected to {uri}')
         self._setup_log()
+        # Arm only now that the link is actually up — a request sent before the
+        # connection completes is dropped, and the drone never arms.
+        self.cf.supervisor.send_arming_request(True)
         self._connected_ok = True
 
     def _disconnected(self, uri):
