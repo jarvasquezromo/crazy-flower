@@ -88,10 +88,22 @@ class Surveyer:
         self.height_offset = 0.0
         self.angle_offset = 0.0
         self._last_mapping_key = None
+        self._hold_start_time = None
+        self._hold_context = None
 
     def _reset_stabilization(self):
         self.stabilization_start_time = None
         self.stabilization_context = None
+
+    def _hold_elapsed(self, sensor_data, context_key, duration_s):
+        if self._hold_context != context_key:
+            self._hold_context = context_key
+            self._hold_start_time = float(sensor_data['t'])
+            return False
+        if self._hold_start_time is None:
+            self._hold_start_time = float(sensor_data['t'])
+            return False
+        return (float(sensor_data['t']) - self._hold_start_time) >= duration_s
 
     def _stable_at_target(self, sensor_data, control_command, context_key):
         if not self.reached_target(sensor_data, control_command, threshold=0.5):
@@ -333,8 +345,8 @@ class Surveyer:
             target_x, target_y, target_z = self.target
         else:
             target_x, target_y, target_z = self.gate_center
-        target_x -= 0.5 * np.cos(self.heading + np.pi / 2)
-        target_y -= 0.5 * np.sin(self.heading + np.pi / 2)
+        target_x -= 0.6 * np.cos(self.heading + np.pi / 2)
+        target_y -= 0.6 * np.sin(self.heading + np.pi / 2)
         target_yaw = self.heading + np.pi / 2
         return [target_x, target_y, target_z, target_yaw]
 
@@ -368,31 +380,39 @@ class Surveyer:
             if mapping_key != self._last_mapping_key:
                 self._reset_stabilization()
                 self._last_mapping_key = mapping_key
-            if self._stable_at_target(sensor_data, control_command, (gate_id, self.mapping_progress, self.mapping_radius_idx)):
-                if self.acquire_gate(sensor_data, camera_data):
-                    observed_segment = self.segment_from_xy(self.gate_center[0], self.gate_center[1])
+            if self.acquire_gate(sensor_data, camera_data):
+                observed_segment = self.segment_from_xy(self.gate_center[0], self.gate_center[1])
 
-                    if observed_segment == gate_id:
-                        self.mapping_progress += 1
-                    else:
-                        self.gate_center = None
-                        self._advance_mapping_radius()
-
-                    self._reset_stabilization()
+                if observed_segment == gate_id:
+                    self.mapping_progress += 1
+                    self._hold_context = None
                 else:
+                    self.gate_center = None
                     self._advance_mapping_radius()
-                    self._reset_stabilization()
+                    self._hold_context = None
+
+                self._reset_stabilization()
+            elif self._hold_elapsed(sensor_data, (gate_id, self.mapping_progress, self.mapping_radius_idx), 10.0):
+                self._advance_mapping_radius()
+                self._reset_stabilization()
+                self._hold_context = None
 
         elif self.mapping_progress == 1:
             control_command = self.fly_before_gate()
-            if self._stable_at_target(sensor_data, control_command, (gate_id, self.mapping_progress)):
-                if self.acquire_gate(sensor_data, camera_data, check=True):
-                    center = np.asarray(self.gate_center, dtype=float)
-                    self.gates += [[center[0], center[1], center[2]]]
-                    observed_segment = self.segment_from_xy(center[0], center[1])
-                    self.record_gate_observation(observed_segment, center, self.heading)
-                    self.mapping_progress += 1
-                    self._reset_stabilization()
+            if self.acquire_gate(sensor_data, camera_data, check=True):
+                center = np.asarray(self.gate_center, dtype=float)
+                self.gates += [[center[0], center[1], center[2]]]
+                observed_segment = self.segment_from_xy(center[0], center[1])
+                self.record_gate_observation(observed_segment, center, self.heading)
+                self.mapping_progress += 1
+                self._reset_stabilization()
+                self._hold_context = None
+            elif self._hold_elapsed(sensor_data, (gate_id, self.mapping_progress), 10.0):
+                self.mapping_progress = 0
+                self.gate_center = None
+                self._advance_mapping_radius()
+                self._reset_stabilization()
+                self._hold_context = None
 
         elif self.mapping_progress == 2:
             control_command = self.fly_to_target()
@@ -526,9 +546,12 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_ctrl_time = time.monotonic()
         self._log_ready = False
         self._cmd_pos = None
-        self._max_xy_speed = 0.04
-        self._max_z_speed = 0.02
-        self._max_yaw_rate = 25.0
+        self._xy_step = 0.02
+        self._z_step = 0.01
+        self._yaw_step_deg = 5.0
+        self._ramp_target = None
+        self._ramp_pos_eps = 1e-3
+        self._ramp_yaw_eps = np.deg2rad(0.5)
         self._debug_last = 0.0
         self._debug_wait_last = 0.0
         self._debug_frame_last = 0.0
@@ -664,32 +687,42 @@ class FPVWindow(QtWidgets.QWidget):
     def _ramp_setpoint(self, cmd, dt):
         if self._cmd_pos is None:
             self._cmd_pos = [float(cmd[0]), float(cmd[1]), float(cmd[2]), float(cmd[3])]
-            return list(self._cmd_pos)
+            self._ramp_target = list(self._cmd_pos)
+            return [self._cmd_pos[0], self._cmd_pos[1], self._cmd_pos[2], np.degrees(self._cmd_pos[3])]
 
-        dt = max(float(dt), 1e-3)
-        target = np.array([float(cmd[0]), float(cmd[1]), float(cmd[2])], dtype=float)
+        target = [float(cmd[0]), float(cmd[1]), float(cmd[2]), float(cmd[3])]
+        if self._ramp_target is None:
+            self._ramp_target = list(target)
+        else:
+            delta_pos = np.linalg.norm(np.array(target[:3]) - np.array(self._ramp_target[:3]))
+            yaw_delta = np.arctan2(
+                np.sin(target[3] - self._ramp_target[3]),
+                np.cos(target[3] - self._ramp_target[3]),
+            )
+            if delta_pos > self._ramp_pos_eps or abs(yaw_delta) > self._ramp_yaw_eps:
+                self._ramp_target = list(target)
+
         current = np.array(self._cmd_pos[:3], dtype=float)
-        delta = target - current
+        target_pos = np.array(self._ramp_target[:3], dtype=float)
+        delta = target_pos - current
 
-        max_xy_step = self._max_xy_speed * dt
-        max_z_step = self._max_z_speed * dt
         xy_step = delta[:2]
         xy_norm = float(np.linalg.norm(xy_step))
-        if xy_norm > max_xy_step:
-            xy_step = xy_step * (max_xy_step / max(xy_norm, 1e-6))
-        z_step = float(np.clip(delta[2], -max_z_step, max_z_step))
+        if xy_norm > self._xy_step:
+            xy_step = xy_step * (self._xy_step / max(xy_norm, 1e-6))
+        z_step = float(np.clip(delta[2], -self._z_step, self._z_step))
 
         next_pos = current + np.array([xy_step[0], xy_step[1], z_step], dtype=float)
 
-        yaw_target = float(cmd[3])
+        yaw_target = float(self._ramp_target[3])
         yaw_current = float(self._cmd_pos[3])
         yaw_diff = np.arctan2(np.sin(yaw_target - yaw_current), np.cos(yaw_target - yaw_current))
-        max_yaw_step = np.deg2rad(self._max_yaw_rate) * dt
+        max_yaw_step = np.deg2rad(self._yaw_step_deg)
         yaw_step = float(np.clip(yaw_diff, -max_yaw_step, max_yaw_step))
         next_yaw = yaw_current + yaw_step
 
         self._cmd_pos = [float(next_pos[0]), float(next_pos[1]), float(next_pos[2]), float(next_yaw)]
-        return list(self._cmd_pos)
+        return [self._cmd_pos[0], self._cmd_pos[1], self._cmd_pos[2], np.degrees(self._cmd_pos[3])]
 
     def _set_status(self, text):
         QtCore.QMetaObject.invokeMethod(
