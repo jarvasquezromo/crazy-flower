@@ -49,7 +49,7 @@ MAX_DH_PER_S = 0.6
 # --- Gate projection method ---
 # True  = mono-height method (from GatesDetector: uses known gate height + pinhole)
 # False = PnP/bbox method (solvePnP with 4 corners, fallback to bbox-width range)
-USE_MONO_HEIGHT_PROJECTION = False
+USE_MONO_HEIGHT_PROJECTION = True
 GATE_PHYS_H = 0.4  # metres, physical gate height (for mono-height method)
 
 # --- Camera / world-frame projection ---

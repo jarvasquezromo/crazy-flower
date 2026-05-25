@@ -1,5 +1,6 @@
 """FPV window: GUI, video pipeline, Crazyflie connection, keyboard."""
 import sys
+import time
 import threading
 import warnings
 
@@ -211,7 +212,7 @@ class FPVWindow(QtWidgets.QWidget):
                 target_gate=self._sm.gates_passed + 1,
             )
 
-        if done:
+        if done and not self._replay:
             if self.cf:
                 self.cf.commander.send_stop_setpoint()
             self._timer.stop()
