@@ -932,16 +932,11 @@ class FPVWindow(QtWidgets.QWidget):
                         self._state_t0 = now
 
         elif self._gate_state == "PUSH":
-            # Drive straight forward (yaw held) until we have travelled
-            # PASS_THROUGH_DIST (measured by odometry), so a slow push still
-            # clears the gate. Falls back to a time limit for safety.
+            # Blind straight push: hold the committed height AND heading and drive
+            # straight forward (no yaw / lateral / height servoing) until we have
+            # travelled PASS_THROUGH_DIST (measured by odometry), so a slow push
+            # still clears the gate. Falls back to a time limit for safety.
             x_cmd = FORWARD_SPEED
-            # Keep correcting altitude toward the gate while it is still visible:
-            # PUSH otherwise freezes the height setpoint for the whole traversal,
-            # so a commit made slightly low would be locked in. Once the gate
-            # leaves the frame (found == False) the last height simply holds.
-            if found and bbox is not None:
-                self._servo_gate_height(ey, area / img_area, dt)
             travelled = float(np.hypot(est['x'] - self._push_start[0],
                                        est['y'] - self._push_start[1]))
             if travelled >= PASS_THROUGH_DIST or (now - self._state_t0) >= PUSH_MAX_DURATION:
