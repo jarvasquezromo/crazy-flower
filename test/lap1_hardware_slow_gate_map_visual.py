@@ -460,7 +460,7 @@ class UdpVideoThread(QtCore.QThread):
 # ---------------------------------------------------------------------------
 # If the drone turns away from the gate instead of toward it, change YAW_SIGN
 # from +1.0 to -1.0.
-YAW_SIGN = 1.0
+YAW_SIGN = -1.0
 
 # If height correction is backwards, change Z_SIGN from -1.0 to +1.0.
 # With normal image coordinates, ey > 0 means the gate is below image centre,

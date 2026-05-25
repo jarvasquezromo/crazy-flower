@@ -526,9 +526,9 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_ctrl_time = time.monotonic()
         self._log_ready = False
         self._cmd_pos = None
-        self._max_xy_speed = 0.1
-        self._max_z_speed = 0.05
-        self._max_yaw_rate = 60.0
+        self._max_xy_speed = 0.04
+        self._max_z_speed = 0.02
+        self._max_yaw_rate = 25.0
         self._debug_last = 0.0
         self._debug_wait_last = 0.0
         self._debug_frame_last = 0.0
