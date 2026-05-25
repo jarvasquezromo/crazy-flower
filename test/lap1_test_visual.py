@@ -193,7 +193,7 @@ PUSH_AREA_STALL_FRAMES = 8   # consecutive frames without meaningful area growth
 PUSH_AREA_GROWTH_EPS = 0.003 # area fraction increase required to reset stall counter
 
 FORWARD_SPEED = 0.1          # m/s in body X, during push-through
-TAKEOFF_HEIGHT  = 1.0        # meters above the starting position
+TAKEOFF_HEIGHT  = 1.35        # meters above the starting position
 TAKEOFF_YAW_DEG = -90.0      # heading (deg) to face when takeoff completes
 TAKEOFF_YAW_TOL = 5.0        # deg; takeoff done once within this of the target heading
 K_TAKEOFF_YAW   = 2.0        # deg/s yaw-rate per deg of heading error
