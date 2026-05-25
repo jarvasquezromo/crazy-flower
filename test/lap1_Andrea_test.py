@@ -149,7 +149,7 @@ MAX_YAWRATE = 70.0           # deg/s
 K_YAW = 80.0                 # deg/s per normalized x error
 
 FORWARD_SPEED = 0.35         # m/s in body X, during push-through
-PUSH_DURATION_S = 1.0
+PUSH_DURATION_S = 2.0
 SEARCH_HEIGHT = 1.2          # meters, target height for search/center
 TAKEOFF_START_HEIGHT = 0.1   # meters, initial setpoint at takeoff
 TAKEOFF_RATE = 0.4           # m/s climb rate during takeoff ramp
@@ -449,7 +449,7 @@ class UdpVideoThread(QtCore.QThread):
 # ---------------------------------------------------------------------------
 # If the drone turns away from the gate instead of toward it, change YAW_SIGN
 # from +1.0 to -1.0.
-YAW_SIGN = 1.0
+YAW_SIGN = -1.0
 
 # If height correction is backwards, change Z_SIGN from -1.0 to +1.0.
 # With normal image coordinates, ey > 0 means the gate is below image centre,
@@ -464,7 +464,7 @@ CENTERED_FRAMES_TO_APPROACH = 3
 APPROACH_SPEED = 0.22           # m/s body-forward, conservative for hardware
 APPROACH_SPEED_SLOW = 0.10      # m/s if almost centered but not perfect
 PASS_SPEED = 0.32               # m/s body-forward through the gate
-PASS_DURATION_S = 1.15
+PASS_DURATION_S = 2.15
 RECOVER_DURATION_S = 0.55
 
 CENTER_TOL_X_APPROACH = 0.16    # allow slow forward if within this

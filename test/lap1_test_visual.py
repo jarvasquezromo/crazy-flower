@@ -185,7 +185,7 @@ CHASE_RECOVER_YAW_PHASE_S = 0.8 # seconds per right/left yaw phase
 # --- Centred-approach / pass-throg gh gating ---
 APPROACH_TOL_X = 0.05        # normalized |ex| to count as "centred" before creeping forward
 APPROACH_TOL_Y = 0.10        # normalized |ey| to count as "centred"
-APPROACH_TARGET_EY = 0.06    # positive: hold gate below image centre -> fly slightly higher
+APPROACH_TARGET_EY = 0.16    # positive: hold gate below image centre -> fly slightly higher
 PASS_CONFIRM_FRAMES = 5      # consecutive big-and-centred frames before committing to PUSH
 PASS_THROUGH_DIST = 1.2      # meters of forward travel in PUSH (distance-based, not time)
 PUSH_MAX_DURATION = 10.0     # seconds, PUSH safety timeout if travel never reached
@@ -206,7 +206,7 @@ MAX_HEIGHT = 2.0             # meters (safety clamp)
 K_HEIGHT = 1.2               # (m/s) per normalized vertical error
 MAX_DH_PER_S = 0.3           # max height change rate (gentle)
 HEIGHT_SLOWDOWN_AREA_FRAC = 0.06  # start reducing z servo gain as the gate gets close
-HEIGHT_MIN_SCALE = 0.30      # minimum z servo gain/rate scale near pass-through
+HEIGHT_MIN_SCALE = 0.60      # minimum z servo gain/rate scale near pass-through
 
 MORPH_KERNEL = np.ones((5, 5), np.uint8)
 
