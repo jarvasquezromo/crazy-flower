@@ -47,11 +47,6 @@ IMG_HEADER_SIZE = 11
 MIN_JPEG_BYTES = 5000
 CALIBRATION_PATH = os.path.join(os.path.dirname(__file__), "calibration.json")
 
-DEFAULT_IMG_W = 324
-DEFAULT_IMG_H = 244
-IMG_WIDTH = DEFAULT_IMG_W
-IMG_HEIGHT = DEFAULT_IMG_H
-
 GREEN_MIN_V = 240
 GREEN_HSV_LO = np.array([35, 50, 50], dtype=np.uint8)
 GREEN_HSV_HI = np.array([85, 255, 255], dtype=np.uint8)
@@ -102,6 +97,8 @@ def _scaled_calibration(calib, img_w, img_h):
 
 BASE_CALIBRATION = _load_calibration()
 CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
+IMG_WIDTH = int(CAMERA_CALIBRATION["img_w"])
+IMG_HEIGHT = int(CAMERA_CALIBRATION["img_h"])
 CAMERA_FX = float(CAMERA_CALIBRATION["fx"])
 CAMERA_FY = float(CAMERA_CALIBRATION["fy"])
 CAMERA_CX = float(CAMERA_CALIBRATION["cx"])
