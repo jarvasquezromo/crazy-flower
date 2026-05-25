@@ -62,6 +62,8 @@ GATE_APPROX_EPS = 0.04
 
 SEARCH_YAWRATE = 10.0
 SEARCH_SWEEP_LIMIT_DEG = 90.0
+TAKEOFF_TARGET_Z = 0.9
+TAKEOFF_RATE = 0.45
 START_BACKUP_DISTANCE_M = 0.35
 START_BACKUP_MAX_SPEED = 0.12
 RECOVER_YAWRATE = 12.0
@@ -604,23 +606,35 @@ class FPVWindow(QtWidgets.QWidget):
             return
 
         if self._state == "WAIT":
-            heading_rad = np.deg2rad(float(est["yaw"]))
             self._pos["x"] = est["x"]
             self._pos["y"] = est["y"]
             self._initial_z = float(est["z"])
             self._pos["z"] = self._initial_z
             self._pos["yaw"] = float(est["yaw"])
-            self._backup_target = np.array(
-                [
-                    est["x"] - START_BACKUP_DISTANCE_M * np.cos(heading_rad),
-                    est["y"] - START_BACKUP_DISTANCE_M * np.sin(heading_rad),
-                    self._initial_z,
-                    est["yaw"],
-                ],
-                dtype=float,
-            )
-            self._state = "BACKUP"
+            self._state = "TAKEOFF"
             self._state_t0 = now
+
+        if self._state == "TAKEOFF":
+            takeoff_z = max(TAKEOFF_TARGET_Z, float(est["z"]))
+            self._pos["x"] = est["x"]
+            self._pos["y"] = est["y"]
+            self._pos["z"] = float(min(self._pos["z"] + TAKEOFF_RATE * dt, takeoff_z))
+            self._pos["yaw"] = float(est["yaw"])
+
+            if self._pos["z"] >= (takeoff_z - 1e-3):
+                heading_rad = np.deg2rad(float(self._pos["yaw"]))
+                self._initial_z = float(self._pos["z"])
+                self._backup_target = np.array(
+                    [
+                        self._pos["x"] - START_BACKUP_DISTANCE_M * np.cos(heading_rad),
+                        self._pos["y"] - START_BACKUP_DISTANCE_M * np.sin(heading_rad),
+                        self._initial_z,
+                        self._pos["yaw"],
+                    ],
+                    dtype=float,
+                )
+                self._state = "BACKUP"
+                self._state_t0 = now
 
         if self._state == "BACKUP":
             if self._backup_target is None:
