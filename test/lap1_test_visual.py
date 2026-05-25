@@ -156,7 +156,7 @@ GREEN_MIN_V = 240            # set lower (e.g. 120) if detection is too strict
 
 MIN_GREEN_AREA_FRAC = 0.01   # fraction of image area
 CENTER_TOL_X = 0.10          # normalized (0..1) horizontal tolerance
-CENTER_TOL_Y = 0.12          # normalized (0..1) vertical tolerance
+CENTER_TOL_Y = 0.05          # normalized (0..1) vertical tolerance
 
 # Slow & robust profile: gentle yaw scan, gentle servo gains.
 SEARCH_YAWRATE = 12.0      # deg/s, negative = turn left (slow ~30 s full scan)
@@ -178,10 +178,15 @@ CHASE_RECOVER_YAW_PHASE_S = 0.8 # seconds per right/left yaw phase
 
 # --- Centred-approach / pass-throg gh gating ---
 APPROACH_TOL_X = 0.05        # normalized |ex| to count as "centred" before creeping forward
-APPROACH_TOL_Y = 0.10        # normalized |ey| to count as "centred"
-APPROACH_TARGET_EY = 0.16    # positive: hold gate below image centre -> fly slightly higher
+APPROACH_TOL_Y = 0.05        # normalized |ey| to count as "centred" for the forward creep
+APPROACH_TARGET_EY = 0.26    # positive: hold gate below image centre -> fly higher. Larger
+                             # value = more vertical clearance above the gate centre, to
+                             # survive z-estimate noise + drift during the frozen blind push.
+PUSH_EY_LOW_MARGIN = 0.05    # only commit to PUSH when ey >= TARGET_EY - this (i.e. at or
+                             # ABOVE the intended clearance, never below it). Prevents
+                             # committing on the low edge of the centred band.
 PASS_CONFIRM_FRAMES = 5      # consecutive big-and-centred frames before committing to PUSH
-PASS_THROUGH_DIST = 1.2      # meters of forward travel in PUSH (distance-based, not time)
+PASS_THROUGH_DIST = 2.0      # meters of forward travel in PUSH (distance-based, not time)
 PUSH_MAX_DURATION = 10.0     # seconds, PUSH safety timeout if travel never reached
 PUSH_FALLBACK_AREA_FRAC = 0.10  # push if CHASE stalls after reaching this area fraction
 PUSH_AREA_STALL_FRAMES = 8   # consecutive frames without meaningful area growth
@@ -200,7 +205,7 @@ MAX_HEIGHT = 2.0             # meters (safety clamp)
 K_HEIGHT = 1.2               # (m/s) per normalized vertical error
 MAX_DH_PER_S = 0.3           # max height change rate (gentle)
 HEIGHT_SLOWDOWN_AREA_FRAC = 0.06  # start reducing z servo gain as the gate gets close
-HEIGHT_MIN_SCALE = 0.60      # minimum z servo gain/rate scale near pass-through
+HEIGHT_MIN_SCALE = 1.0      # minimum z servo gain/rate scale near pass-through
 
 MORPH_KERNEL = np.ones((5, 5), np.uint8)
 
@@ -874,6 +879,12 @@ class FPVWindow(QtWidgets.QWidget):
                     ey_err = self._servo_gate_height(ey_t, area_frac, dt)
 
                     centred = (abs(ex_t) <= APPROACH_TOL_X) and (abs(ey_err) <= APPROACH_TOL_Y)
+                    # High-biased height gate for COMMIT (not creep): the drone must
+                    # be at or ABOVE the intended clearance, never on the low edge.
+                    # ey_err < 0 means the gate is higher in the image than target
+                    # -> drone is too LOW; require ey_err >= -PUSH_EY_LOW_MARGIN.
+                    height_ok_for_push = (-PUSH_EY_LOW_MARGIN <= ey_err <= APPROACH_TOL_Y)
+                    centred_for_push = (abs(ex_t) <= APPROACH_TOL_X) and height_ok_for_push
 
                     # Commit to PUSH only after the gate is BIG and CENTRED for a
                     # few consecutive *frames* (robust against one-off area
@@ -886,13 +897,13 @@ class FPVWindow(QtWidgets.QWidget):
                         else:
                             self._chase_area_stall += 1
 
-                        if centred and (area_frac > PASS_AREA_FRAC):
+                        if centred_for_push and (area_frac > PASS_AREA_FRAC):
                             self._push_confirm += 1
                         else:
                             self._push_confirm = 0
 
                     fallback_push = (
-                        abs(ey_err) <= APPROACH_TOL_Y
+                        height_ok_for_push
                         and
                         area_frac >= PUSH_FALLBACK_AREA_FRAC
                         and self._chase_area_stall >= PUSH_AREA_STALL_FRAMES
@@ -905,6 +916,16 @@ class FPVWindow(QtWidgets.QWidget):
                         self._push_start = (est['x'], est['y'])
                         self._gate_state = "PUSH"
                         self._state_t0   = now
+                        # Commit-time clearance check: log commanded height and the
+                        # last projected gate-centre height so the true vertical
+                        # margin (and any low push) can be verified on hardware.
+                        gate_z = self._last_est_gate[2] if self._last_est_gate is not None else float('nan')
+                        print(
+                            f"[PUSH commit] ey={ey_t:+.3f} ey_err={ey_err:+.3f} "
+                            f"area={area_frac*100:.1f}% via={'fallback' if fallback_push else 'confirm'} "
+                            f"| height_cmd={self.hover['height']:.2f} drone_z={est['z']:.2f} "
+                            f"gate_z={gate_z:.2f} clearance={est['z'] - gate_z:+.2f}m"
+                        )
                         # Commit cleanly: no residual steering on the commit tick;
                         # the push is blind/straight from here.
                         x_cmd = y_cmd = yaw_cmd = 0.0
