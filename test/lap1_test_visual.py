@@ -168,6 +168,12 @@ K_LATERAL = 0.12             # m/s body-Y per normalized x error
 MAX_LATERAL = 0.15           # m/s lateral clamp
 CHASE_FORWARD = 0.12         # m/s forward creep (only applied once gate is centred)
 ALIGN_FALLOFF = 0.60         # |ex| at which forward creep is fully suppressed (legacy)
+# Perspective square-up: strafe sideways to equalise the gate's left/right
+# vertical-edge pixel heights, so the drone faces the gate plane head-on. Yaw
+# keeps the gate centred; lateral does the squaring (decoupled).
+K_ALIGN = 0.40               # m/s body-Y per unit normalised edge-height difference
+ALIGN_TOL = 0.15             # |edge-height diff| below which the gate counts as squared
+ALIGN_MIN_EDGE_PX = 8.0      # min vertical-edge pixel height for a usable alignment cue
 CHASE_RETURN_K = 0.6         # proportional velocity gain back to last good CHASE pose
 CHASE_RETURN_MAX_SPEED = 0.12  # m/s clamp when returning after losing the gate
 CHASE_RETURN_TOL = 0.05      # m; stop once back at the last good CHASE pose
@@ -841,6 +847,7 @@ class FPVWindow(QtWidgets.QWidget):
                 if sel is not None:
                     cand, snapped = sel
                     ex_t, ey_t, area_t = cand["ex"], cand["ey"], cand["area"]
+                    corners_t = cand.get("corners")
                     self._last_est_gate = snapped
                     self._last_est_in_zone = True
                     self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
@@ -853,6 +860,7 @@ class FPVWindow(QtWidgets.QWidget):
                     primary_gw = self._gate_to_world(corners, verbose=False)
                     if found and primary_gw is None and (area / img_area) > 0.5 * PASS_AREA_FRAC:
                         ex_t, ey_t, area_t = ex, ey, area
+                        corners_t = corners
                         self._last_est_in_zone = None
                         self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
                         self._state_t0 = now
@@ -871,20 +879,38 @@ class FPVWindow(QtWidgets.QWidget):
                 else:
                     area_frac = area_t / img_area
 
-                    # --- Servo yaw + height to centre the TARGET gate ---
+                    # --- Servo yaw + lateral + height ---
+                    # Yaw keeps the gate horizontally centred (camera points at it).
                     yaw_cmd = float(np.clip(-K_YAW * ex_t, -MAX_YAWRATE, MAX_YAWRATE))
-                    y_cmd = float(np.clip(-K_LATERAL * ex_t, -MAX_LATERAL, MAX_LATERAL))
+                    # Lateral squares the drone up to the gate plane by equalising
+                    # the left/right vertical-edge heights. When the corners are
+                    # unusable (clipped at close range / too small) fall back to
+                    # lateral centring on ex so horizontal control is never lost.
+                    align_err = self._gate_edge_alignment(corners_t)
+                    if align_err is not None:
+                        y_cmd = float(np.clip(K_ALIGN * align_err, -MAX_LATERAL, MAX_LATERAL))
+                    else:
+                        y_cmd = float(np.clip(-K_LATERAL * ex_t, -MAX_LATERAL, MAX_LATERAL))
                     # Height: drive the gate toward APPROACH_TARGET_EY (held
                     # slightly below image centre -> drone flies slightly higher).
                     ey_err = self._servo_gate_height(ey_t, area_frac, dt)
 
-                    centred = (abs(ex_t) <= APPROACH_TOL_X) and (abs(ey_err) <= APPROACH_TOL_Y)
+                    # Squared when the edge heights are nearly equal (or no usable
+                    # cue, in which case we don't block on alignment).
+                    aligned = (align_err is None) or (abs(align_err) <= ALIGN_TOL)
+                    centred = (
+                        abs(ex_t) <= APPROACH_TOL_X
+                        and abs(ey_err) <= APPROACH_TOL_Y
+                        and aligned
+                    )
                     # High-biased height gate for COMMIT (not creep): the drone must
                     # be at or ABOVE the intended clearance, never on the low edge.
                     # ey_err < 0 means the gate is higher in the image than target
                     # -> drone is too LOW; require ey_err >= -PUSH_EY_LOW_MARGIN.
                     height_ok_for_push = (-PUSH_EY_LOW_MARGIN <= ey_err <= APPROACH_TOL_Y)
-                    centred_for_push = (abs(ex_t) <= APPROACH_TOL_X) and height_ok_for_push
+                    centred_for_push = (
+                        abs(ex_t) <= APPROACH_TOL_X and height_ok_for_push and aligned
+                    )
 
                     # Commit to PUSH only after the gate is BIG and CENTRED for a
                     # few consecutive *frames* (robust against one-off area
@@ -1003,6 +1029,28 @@ class FPVWindow(QtWidgets.QWidget):
         self.hover['height'] = float(np.clip(self.hover['height'], MIN_HEIGHT, MAX_HEIGHT))
         self.cf.commander.send_hover_setpoint(
             self.hover['x'], self.hover['y'], self.hover['yaw'], self.hover['height'])
+
+    def _gate_edge_alignment(self, corners):
+        """Normalised left/right vertical-edge height difference of the gate.
+
+        Corners are ordered TL, TR, BR, BL. The left edge height is BL.y - TL.y
+        and the right edge height is BR.y - TR.y (image y grows downward). When
+        the drone is square to the gate plane the two project equally; viewing
+        from an angle makes the near edge taller. Returns
+        ``(right_h - left_h) / (right_h + left_h)`` — 0 when squared, >0 when the
+        right edge is taller (drone too far right -> strafe left). Returns None
+        when the corners are missing/degenerate so the caller can fall back.
+        """
+        if corners is None:
+            return None
+        c = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+        if c.shape[0] != 4:
+            return None
+        left_h = float(c[3][1] - c[0][1])   # BL.y - TL.y
+        right_h = float(c[2][1] - c[1][1])  # BR.y - TR.y
+        if left_h < ALIGN_MIN_EDGE_PX or right_h < ALIGN_MIN_EDGE_PX:
+            return None
+        return (right_h - left_h) / (right_h + left_h)
 
     def _servo_gate_height(self, ey_t, area_frac, dt):
         """Nudge the absolute-height setpoint to hold the gate at APPROACH_TARGET_EY.
