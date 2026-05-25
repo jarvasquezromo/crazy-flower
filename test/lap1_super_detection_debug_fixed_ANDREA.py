@@ -89,7 +89,7 @@ class Surveyer:
         self.detected_gate_ids = []
         self.detected_gate_angles = []
         self.pass_through_distance = 0.5
-        self.stabilization_wait_duration = 6
+        self.stabilization_wait_duration = 1.2  # seconds to hold each yaw-search view
         self.stabilization_start_time = None
         self.stabilization_context = None
         self.mapping_radii = [0.75, 1.1, 1.4]
@@ -101,6 +101,15 @@ class Surveyer:
         self._hold_context = None
         self._debug_gate_last = 0.0
         self._debug_map_last = 0.0
+
+        # Deterministic yaw sweep used when the gate is not visible from the
+        # first search direction.  This covers 180 deg total around the nominal
+        # gate-looking direction: center, right side, then left side.
+        # Negative yaw offset is usually a right-looking turn in this setup;
+        # if it starts left instead, swap the signs/order.
+        self.search_yaw_offsets_deg = [0.0, -30.0, -60.0, -90.0, 30.0, 60.0, 90.0]
+        self.search_yaw_idx = 0
+        self.search_exhausted = False
 
     def _reset_stabilization(self):
         self.stabilization_start_time = None
@@ -325,13 +334,42 @@ class Surveyer:
         target_z += self.height_offset
         target_yaw_rad += self.angle_offset
 
-        target_yaw_deg = wrap_deg(rad_to_deg(target_yaw_rad))
+        yaw_offset_deg = self.search_yaw_offsets_deg[self.search_yaw_idx]
+        target_yaw_deg = wrap_deg(rad_to_deg(target_yaw_rad) + yaw_offset_deg)
         return [target_x, target_y, target_z, target_yaw_deg]
 
     def _advance_mapping_radius(self):
-        self.mapping_radius_idx = (self.mapping_radius_idx + 1) % len(self.mapping_radii)
+        # Keep radius fixed for the safe 180-degree yaw search mode.
+        # The drone should not keep moving to new viewpoints if the gate is not found.
+        self.mapping_radius_idx = self.mapping_radius_idx
         self.height_offset = 0.0
         self.angle_offset = 0.0
+
+    def _advance_search_yaw_or_hover(self):
+        """Move to the next yaw-search direction, or stop and hover.
+
+        The search sequence rotates only in yaw at the same x/y/z search pose.
+        After the 180-degree sweep is exhausted, the drone holds its current
+        estimated position/yaw instead of flying to a new place.
+        """
+        self.search_yaw_idx += 1
+        if self.search_yaw_idx >= len(self.search_yaw_offsets_deg):
+            self.search_yaw_idx = len(self.search_yaw_offsets_deg) - 1
+            self.search_exhausted = True
+            return False
+        return True
+
+    def _reset_search_yaw(self):
+        self.search_yaw_idx = 0
+        self.search_exhausted = False
+
+    def _hover_in_place_command(self, sensor_data):
+        return [
+            float(sensor_data['x_global']),
+            float(sensor_data['y_global']),
+            max(float(sensor_data['z_global']), 1.0),
+            float(sensor_data['yaw']),
+        ]
 
     @staticmethod
     def segment_from_xy(x, y, center_x=COURSE_CENTER_X, center_y=COURSE_CENTER_Y):
@@ -404,12 +442,43 @@ class Surveyer:
         ]
 
         if self.mapping_progress == 0:
+            # If the complete 180-degree yaw sweep did not find a valid gate,
+            # stay safe: hover in place. Still keep checking the current camera
+            # view in case the gate appears again, but do not start translating.
+            if self.search_exhausted:
+                now = float(sensor_data.get('t', 0.0))
+                if now - self._debug_map_last >= 0.8:
+                    self._debug_map_last = now
+                    img_candidates = len(self._detect_gate_candidates(camera_data))
+                    print(
+                        f"SEARCH gate={gate_id + 1}: yaw sweep exhausted -> HOVER, "
+                        f"image_candidates={img_candidates}"
+                    )
+
+                if self.acquire_gate(sensor_data, camera_data):
+                    center = np.asarray(self.gate_center, dtype=float)
+                    observed_segment = self.segment_from_xy(center[0], center[1])
+                    print(f"Observed segment={observed_segment}, expected={gate_id}")
+                    if observed_segment == gate_id:
+                        self.gates += [[center[0], center[1], center[2]]]
+                        self.record_gate_observation(observed_segment, center, self.heading)
+                        self.mapping_progress = 2
+                        self._reset_search_yaw()
+                        self._reset_stabilization()
+                        self._hold_context = None
+                        return self.fly_to_target()
+                    else:
+                        self.gate_center = None
+
+                return self._hover_in_place_command(sensor_data)
+
             radius = self.mapping_radii[self.mapping_radius_idx]
             control_command = self.fly_to_mapping_position(gate_id, radius=radius)
-            mapping_key = (gate_id, self.mapping_progress, self.mapping_radius_idx)
+            yaw_offset = self.search_yaw_offsets_deg[self.search_yaw_idx]
+            mapping_key = (gate_id, self.mapping_progress, self.mapping_radius_idx, self.search_yaw_idx)
 
-            # Important: do not keep changing the search target while the drone is still travelling.
-            # First reach and hold the search viewpoint, then try to use the camera.
+            # Go to the search point, then rotate through the yaw offsets in place.
+            # We only try to approach after the drone is stable at a yaw view.
             at_search_pose = self._stable_at_target(sensor_data, control_command, mapping_key)
 
             now = float(sensor_data.get('t', 0.0))
@@ -418,7 +487,9 @@ class Surveyer:
                 img_candidates = len(self._detect_gate_candidates(camera_data))
                 print(
                     f"SEARCH gate={gate_id + 1} radius={radius:.2f} "
-                    f"stable={int(at_search_pose)} image_candidates={img_candidates}"
+                    f"yaw_idx={self.search_yaw_idx}/{len(self.search_yaw_offsets_deg)-1} "
+                    f"yaw_offset={yaw_offset:+.0f}deg stable={int(at_search_pose)} "
+                    f"image_candidates={img_candidates}"
                 )
 
             if at_search_pose:
@@ -431,18 +502,19 @@ class Surveyer:
                         self.gates += [[center[0], center[1], center[2]]]
                         self.record_gate_observation(observed_segment, center, self.heading)
                         self.mapping_progress = 2
+                        self._reset_search_yaw()
                     else:
                         # Image detection exists, but the world estimate is in the wrong segment.
-                        # Try the next search radius instead of flying to a suspicious gate.
+                        # Do not approach. Continue the yaw sweep, then hover if exhausted.
                         self.gate_center = None
-                        self._advance_mapping_radius()
+                        self._advance_search_yaw_or_hover()
 
                     self._hold_context = None
                     self._reset_stabilization()
                 else:
-                    # Only advance to another radius after the drone has actually stabilized
-                    # at this search pose and still cannot produce a valid 3D gate.
-                    self._advance_mapping_radius()
+                    # No valid gate from this yaw view: rotate to the next yaw view.
+                    # After the 180-degree sweep is exhausted, hover in place.
+                    self._advance_search_yaw_or_hover()
                     self._hold_context = None
                     self._reset_stabilization()
 
@@ -453,10 +525,10 @@ class Surveyer:
                 self.gate_to_go += 1
                 self.gate_center = None
                 self.mapping_radius_idx = 0
+                self._reset_search_yaw()
                 self._reset_stabilization()
 
         return control_command
-
 
 class MyAssignment:
     def __init__(self):
