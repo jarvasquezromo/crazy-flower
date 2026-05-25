@@ -253,14 +253,10 @@ GATE_EMA_ALPHA = 0.35  # smoothing factor when refining a locked gate pose
 # drone advances a small amount.
 BLIND_PUSH_TIMEOUT = 1.5  # seconds since last seen to allow blind push
 
-# --- Slow-hardware command gating (real flight: vision can be 1-2 FPS) ---
-CHASE_PUSH_CMD_HZ = 5.0  # command rate limit in CHASE/PUSH
-CHASE_PUSH_CMD_DT = 1.0 / CHASE_PUSH_CMD_HZ
-CHASE_PUSH_SETTLE_S = 0.35  # wait this long after entering CHASE/PUSH
-CMD_IMMEDIATE_MIN_DT = 0.08  # avoid bursts even when significant changes happen
-CMD_IMMEDIATE_POS_JUMP = 0.15  # m; immediate send if target position jumps
-CMD_IMMEDIATE_YAW_JUMP = 10.0  # deg; immediate send if target yaw jumps
-CMD_IMMEDIATE_AREA_JUMP = 0.03  # area fraction delta for immediate send
+# --- Major-command completion locks (keep streaming setpoints continuously) ---
+WAYPOINT_SETTLE_S = 0.30  # hold after waypoint switch before accepting next one
+GATE_REPLAN_MIN_DT = 0.40  # minimum time between CHASE trajectory replans
+GATE_REPLAN_FORCE_SHIFT = 0.25  # m gate-pose jump that can force an earlier replan
 
 
 @contextlib.contextmanager
@@ -641,19 +637,12 @@ class FPVWindow(QtWidgets.QWidget):
             "seq": 0,
         }
 
-        # Command throttling state for slow hardware (vision 1-2 FPS).
+        # Vision sequence number for debugging/telemetry.
         self._vision_seq = 0
-        self._last_sent_vision_seq = -1
-        self._last_cmd_sent_time = 0.0
-        self._last_cmd_state = None
-        self._cmd_hold_until = 0.0
-        self._last_cmd_target = {
-            "x": 0.0,
-            "y": 0.0,
-            "z": 0.0,
-            "yaw": 0.0,
-            "area": 0.0,
-        }
+
+        # Major-command lock state: do not chain large target changes too quickly.
+        self._wp_settle_until = 0.0
+        self._last_replan_time = 0.0
 
         self._last_ctrl_time = time.monotonic()
 
@@ -766,7 +755,6 @@ class FPVWindow(QtWidgets.QWidget):
         now = time.monotonic()
         dt = float(np.clip(now - self._last_ctrl_time, 0.02, 0.3))
         self._last_ctrl_time = now
-        significant_update = False
 
         if self._gate_state == "STOP":
             # Safety brake: command zero velocity (hold in place, no motion).
@@ -787,7 +775,6 @@ class FPVWindow(QtWidgets.QWidget):
             area = float(self._vision.get("area", 0.0))
             corners = self._vision.get("corners", None)
             candidates = list(self._vision.get("candidates", []))
-            vision_seq = int(self._vision.get("seq", 0))
         with self._pos_lock:
             est = dict(self._est)
 
@@ -865,7 +852,8 @@ class FPVWindow(QtWidgets.QWidget):
                     self._chase_area_stall = 0
                     self._gate_state = "CHASE"
                     self._state_t0 = now
-                    significant_update = True
+                    self._wp_settle_until = now + WAYPOINT_SETTLE_S
+                    self._last_replan_time = now
             else:
                 self._search_confirm = []
 
@@ -898,16 +886,41 @@ class FPVWindow(QtWidgets.QWidget):
                     if self._gate_world is not None:
                         ox, oy, oz = self._gate_world
                         nx, ny, nz = snapped
+                        gate_shift = float(np.hypot(nx - ox, ny - oy))
                         self._gate_world = (
                             ox + GATE_EMA_ALPHA * (nx - ox),
                             oy + GATE_EMA_ALPHA * (ny - oy),
                             oz + GATE_EMA_ALPHA * (nz - oz),
                         )
-                        self._gate_waypoints = self._build_traj(self._gate_world)
-                        self._gate_wp_idx = min(
-                            self._gate_wp_idx, len(self._gate_waypoints) - 1
-                        )
-                        significant_update = True
+                        can_replan = False
+                        if not self._gate_waypoints:
+                            can_replan = True
+                        else:
+                            wp_cur = self._gate_waypoints[
+                                min(self._gate_wp_idx, len(self._gate_waypoints) - 1)
+                            ]
+                            dist_cur = float(
+                                np.hypot(est["x"] - wp_cur[0], est["y"] - wp_cur[1])
+                            )
+                            if dist_cur < WAYPOINT_TOL:
+                                can_replan = True
+                            elif (
+                                gate_shift >= GATE_REPLAN_FORCE_SHIFT
+                                and (now - self._last_replan_time)
+                                >= 0.5 * GATE_REPLAN_MIN_DT
+                            ):
+                                can_replan = True
+
+                        if (
+                            can_replan
+                            and (now - self._last_replan_time) >= GATE_REPLAN_MIN_DT
+                        ):
+                            self._gate_waypoints = self._build_traj(self._gate_world)
+                            self._gate_wp_idx = min(
+                                self._gate_wp_idx, len(self._gate_waypoints) - 1
+                            )
+                            self._last_replan_time = now
+                            self._wp_settle_until = now + WAYPOINT_SETTLE_S
                     # record the time we last saw a usable target
                     self._last_seen_time = now
                 else:
@@ -946,10 +959,11 @@ class FPVWindow(QtWidgets.QWidget):
                     dist_wp = float(np.hypot(est["x"] - wp[0], est["y"] - wp[1]))
                     if (
                         dist_wp < WAYPOINT_TOL
+                        and now >= self._wp_settle_until
                         and self._gate_wp_idx < len(self._gate_waypoints) - 1
                     ):
                         self._gate_wp_idx += 1
-                        significant_update = True
+                        self._wp_settle_until = now + WAYPOINT_SETTLE_S
                     area_frac = area / img_area if img_area > 0 else 0.0
                     if area_frac > PASS_AREA_FRAC:
                         yaw_r = np.deg2rad(est["yaw"])
@@ -964,7 +978,6 @@ class FPVWindow(QtWidgets.QWidget):
                         self._push_confirm = 0
                         self._chase_best_area_frac = 0.0
                         self._chase_area_stall = 0
-                        significant_update = True
                 else:
                     # No waypoint path yet: hold and keep refining the target.
                     self._pos["x"] = est["x"]
@@ -987,7 +1000,8 @@ class FPVWindow(QtWidgets.QWidget):
                 self._chase_area_stall = 0
                 self._gate_state = "CHASE"
                 self._state_t0 = now
-                significant_update = True
+                self._wp_settle_until = now + WAYPOINT_SETTLE_S
+                self._last_replan_time = now
             else:
                 # Scan up, down, back to original height, then yaw right/left.
                 t = now - self._state_t0
@@ -1055,64 +1069,12 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gate_state = "SEARCH"
                 self._last_seen_time = None
                 self._state_t0 = now
-                significant_update = True
 
-        # Apply command with slow-hardware gating in CHASE/PUSH.
-        send_now = True
-        slow_state = self._gate_state in ("CHASE", "PUSH")
-        if slow_state:
-            last = self._last_cmd_target
-            pos_jump = float(
-                np.linalg.norm(
-                    np.array([self._pos["x"], self._pos["y"], self._pos["z"]])
-                    - np.array([last["x"], last["y"], last["z"]])
-                )
-            )
-            yaw_jump = abs(((self._pos["yaw"] - last["yaw"] + 180.0) % 360.0) - 180.0)
-            area_frac = area / img_area if img_area > 0 else 0.0
-            area_jump = abs(area_frac - last["area"])
-            new_frame = vision_seq != self._last_sent_vision_seq
-            state_changed = self._last_cmd_state != self._gate_state
-
-            if state_changed:
-                self._cmd_hold_until = now + CHASE_PUSH_SETTLE_S
-
-            immediate_ok = (
-                state_changed
-                or significant_update
-                or (
-                    new_frame
-                    and (
-                        pos_jump >= CMD_IMMEDIATE_POS_JUMP
-                        or yaw_jump >= CMD_IMMEDIATE_YAW_JUMP
-                        or area_jump >= CMD_IMMEDIATE_AREA_JUMP
-                    )
-                )
-            )
-            elapsed = now - self._last_cmd_sent_time
-            if immediate_ok and elapsed >= CMD_IMMEDIATE_MIN_DT:
-                send_now = True
-            elif now >= self._cmd_hold_until and elapsed >= CHASE_PUSH_CMD_DT:
-                send_now = True
-            else:
-                send_now = False
-
-        # Apply the computed world-frame position + yaw setpoint.
+        # Always stream setpoints; only major-command transitions are locked.
         self._pos["z"] = float(np.clip(self._pos["z"], MIN_HEIGHT, MAX_HEIGHT))
-        if send_now:
-            self.cf.commander.send_position_setpoint(
-                self._pos["x"], self._pos["y"], self._pos["z"], self._pos["yaw"]
-            )
-            self._last_cmd_sent_time = now
-            self._last_cmd_state = self._gate_state
-            self._last_sent_vision_seq = vision_seq
-            self._last_cmd_target = {
-                "x": self._pos["x"],
-                "y": self._pos["y"],
-                "z": self._pos["z"],
-                "yaw": self._pos["yaw"],
-                "area": area / img_area if img_area > 0 else 0.0,
-            }
+        self.cf.commander.send_position_setpoint(
+            self._pos["x"], self._pos["y"], self._pos["z"], self._pos["yaw"]
+        )
 
     def _return_to_last_chase_gate_pose(self, est, dt):
         tx, ty, th = self._last_chase_gate_pose
