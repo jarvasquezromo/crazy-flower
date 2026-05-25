@@ -368,6 +368,17 @@ class Surveyer:
         if gate_position is not None:
             self.gate_center = np.asarray(gate_position, dtype=float)
             self.heading = gate_angle
+            now = float(sensor_data.get('t', 0.0))
+            if now - self._debug_gate_last >= 0.5:
+                self._debug_gate_last = now
+                print(
+                    "Gate world: x={:.2f} y={:.2f} z={:.2f} angle={:.1f}deg".format(
+                        float(self.gate_center[0]),
+                        float(self.gate_center[1]),
+                        float(self.gate_center[2]),
+                        float(np.degrees(self.heading)),
+                    )
+                )
             forward = np.array([
                 np.cos(self.heading + np.pi / 2),
                 np.sin(self.heading + np.pi / 2),
@@ -554,6 +565,7 @@ class FPVWindow(QtWidgets.QWidget):
         self._debug_wait_last = 0.0
         self._debug_frame_last = 0.0
         self._debug_cmd_last = 0.0
+        self._debug_gate_last = 0.0
 
         cflib.crtp.init_drivers()
         self.cf = Crazyflie(ro_cache=None, rw_cache='cache')
