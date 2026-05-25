@@ -114,14 +114,22 @@ def _scaled_calibration(calib, img_w, img_h):
 
 
 BASE_CALIBRATION = _load_calibration()
-CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
-IMG_WIDTH = int(CAMERA_CALIBRATION["img_w"])
-IMG_HEIGHT = int(CAMERA_CALIBRATION["img_h"])
-CAMERA_FX = float(CAMERA_CALIBRATION["fx"])
-CAMERA_FY = float(CAMERA_CALIBRATION["fy"])
-CAMERA_CX = float(CAMERA_CALIBRATION["cx"])
-CAMERA_CY = float(CAMERA_CALIBRATION["cy"])
-DIST_COEFFS = np.array(CAMERA_CALIBRATION["dist_coeffs"], dtype=np.float64)
+
+
+def _apply_calibration(calib):
+    global CAMERA_CALIBRATION, IMG_WIDTH, IMG_HEIGHT, CAMERA_FX, CAMERA_FY, CAMERA_CX, CAMERA_CY, DIST_COEFFS
+
+    CAMERA_CALIBRATION = dict(calib)
+    IMG_WIDTH = int(CAMERA_CALIBRATION["img_w"])
+    IMG_HEIGHT = int(CAMERA_CALIBRATION["img_h"])
+    CAMERA_FX = float(CAMERA_CALIBRATION["fx"])
+    CAMERA_FY = float(CAMERA_CALIBRATION["fy"])
+    CAMERA_CX = float(CAMERA_CALIBRATION["cx"])
+    CAMERA_CY = float(CAMERA_CALIBRATION["cy"])
+    DIST_COEFFS = np.array(CAMERA_CALIBRATION["dist_coeffs"], dtype=np.float64)
+
+
+_apply_calibration(BASE_CALIBRATION)
 
 
 def _set_runtime_calibration(img_w, img_h):
@@ -130,22 +138,14 @@ def _set_runtime_calibration(img_w, img_h):
     if img_w == int(BASE_CALIBRATION["img_w"]) and img_h == int(
         BASE_CALIBRATION["img_h"]
     ):
-        CAMERA_CALIBRATION = dict(BASE_CALIBRATION)
+        _apply_calibration(BASE_CALIBRATION)
         print(f"Radio image size OK: {img_w}x{img_h} matches calibration.json")
     else:
-        CAMERA_CALIBRATION = _scaled_calibration(BASE_CALIBRATION, img_w, img_h)
+        _apply_calibration(_scaled_calibration(BASE_CALIBRATION, img_w, img_h))
         print(
             f"Radio image size {img_w}x{img_h} differs from calibration.json "
             f"{BASE_CALIBRATION['img_w']}x{BASE_CALIBRATION['img_h']}; scaled calibration in memory"
         )
-
-    IMG_WIDTH = int(CAMERA_CALIBRATION["img_w"])
-    IMG_HEIGHT = int(CAMERA_CALIBRATION["img_h"])
-    CAMERA_FX = float(CAMERA_CALIBRATION["fx"])
-    CAMERA_FY = float(CAMERA_CALIBRATION["fy"])
-    CAMERA_CX = float(CAMERA_CALIBRATION["cx"])
-    CAMERA_CY = float(CAMERA_CALIBRATION["cy"])
-    DIST_COEFFS = np.array(CAMERA_CALIBRATION["dist_coeffs"], dtype=np.float64)
 
 
 def _camera_matrix():
@@ -234,6 +234,7 @@ GATE_APPROX_EPS = 0.04  # approxPolyDP epsilon, fraction of perimeter
 # --- Camera / world-frame projection (zone validation + map only) ---
 DEBUG_GATE_POSE = True  # print per-stage gate pose values for debugging
 DEBUG_CALIB = True  # print per-detection calibration numbers (area %, ex/ey, ...)
+DEBUG_CONTROL = True  # print key control transitions (lock, centering, approach, push)
 GATE_PHYS_H = 0.4  # metres, physical gate height — the only fixed dimension
 # (gate width varies between gates and foreshortens with yaw);
 # depth is derived from this height alone
@@ -868,6 +869,12 @@ class FPVWindow(QtWidgets.QWidget):
                     self._state_t0 = now
                     self._wp_settle_until = now + WAYPOINT_SETTLE_S
                     self._last_replan_time = now
+                    if DEBUG_CONTROL:
+                        gx, gy, gz = self._gate_world
+                        print(
+                            f"[CTRL] SEARCH->CHASE gate={gate_idx} world=({gx:.2f}, {gy:.2f}, {gz:.2f}) "
+                            f"waypoints={len(self._gate_waypoints)}"
+                        )
             else:
                 # Slow continuous 360° sweep: the drone keeps turning until a
                 # good gate lock is obtained, which suits 1-2 FPS video much
@@ -942,6 +949,11 @@ class FPVWindow(QtWidgets.QWidget):
                             self._last_replan_time = now
                             self._wp_settle_until = now + WAYPOINT_SETTLE_S
                             self._chase_center_confirm = 0
+                            if DEBUG_CONTROL:
+                                print(
+                                    f"[CTRL] CHASE replan gate={gate_idx} wp_idx={self._gate_wp_idx} "
+                                    f"gate=({self._gate_world[0]:.2f}, {self._gate_world[1]:.2f}, {self._gate_world[2]:.2f})"
+                                )
                     # record the time we last saw a usable target
                     self._last_seen_time = now
                 else:
@@ -992,6 +1004,11 @@ class FPVWindow(QtWidgets.QWidget):
                         # Pre-approach centering stage: hold position, trim yaw
                         # toward the gate and adjust height gently, but do not
                         # advance toward the gate yet.
+                        if self._chase_center_confirm == 0 and DEBUG_CONTROL:
+                            print(
+                                f"[CTRL] CHASE centering gate={gate_idx} ex={ex:+.3f} ey={ey:+.3f} "
+                                f"center_tol=({APPROACH_TOL_X:.2f}, {APPROACH_TOL_Y:.2f})"
+                            )
                         yaw_r = np.deg2rad(est["yaw"])
                         left_x = -np.sin(yaw_r)
                         left_y = np.cos(yaw_r)
@@ -1019,9 +1036,34 @@ class FPVWindow(QtWidgets.QWidget):
                         )
                     else:
                         # Centered: now approach gently via the world-frame waypoints.
-                        self._pos["x"], self._pos["y"], self._pos["z"] = wp
+                        if (
+                            self._chase_center_confirm == CHASE_CENTER_CONFIRM_FRAMES
+                            and DEBUG_CONTROL
+                        ):
+                            print(
+                                f"[CTRL] CHASE centered gate={gate_idx} -> approach start wp_idx={self._gate_wp_idx} "
+                                f"ex={ex:+.3f} ey={ey:+.3f}"
+                            )
+                        dx_wp = float(wp[0] - est["x"])
+                        dy_wp = float(wp[1] - est["y"])
+                        dz_wp = float(wp[2] - est["z"])
+                        dist_wp = float(np.hypot(dx_wp, dy_wp))
+                        if dist_wp > 1e-6:
+                            step = float(min(CHASE_FORWARD * dt, dist_wp))
+                            ux = dx_wp / dist_wp
+                            uy = dy_wp / dist_wp
+                            self._pos["x"] = float(est["x"] + step * ux)
+                            self._pos["y"] = float(est["y"] + step * uy)
+                            self._pos["z"] = float(
+                                np.clip(
+                                    est["z"] + np.clip(dz_wp, -0.03, 0.03),
+                                    MIN_HEIGHT,
+                                    MAX_HEIGHT,
+                                )
+                            )
+                        else:
+                            self._pos["x"], self._pos["y"], self._pos["z"] = wp
                         self._pos["yaw"] = gate_yaw
-                        dist_wp = float(np.hypot(est["x"] - wp[0], est["y"] - wp[1]))
                         if (
                             dist_wp < WAYPOINT_TOL
                             and now >= self._wp_settle_until
@@ -1029,6 +1071,11 @@ class FPVWindow(QtWidgets.QWidget):
                         ):
                             self._gate_wp_idx += 1
                             self._wp_settle_until = now + WAYPOINT_SETTLE_S
+                            if DEBUG_CONTROL:
+                                print(
+                                    f"[CTRL] CHASE advance gate={gate_idx} -> wp_idx={self._gate_wp_idx} "
+                                    f"dist_wp={dist_wp:.2f}"
+                                )
                     area_frac = area / img_area if img_area > 0 else 0.0
                     if area_frac > PASS_AREA_FRAC:
                         yaw_r = np.deg2rad(est["yaw"])
@@ -1043,6 +1090,11 @@ class FPVWindow(QtWidgets.QWidget):
                         self._push_confirm = 0
                         self._chase_best_area_frac = 0.0
                         self._chase_area_stall = 0
+                        if DEBUG_CONTROL:
+                            print(
+                                f"[CTRL] CHASE->PUSH gate={gate_idx} area={area_frac:.2f} "
+                                f"push_target=({self._push_target[0]:.2f}, {self._push_target[1]:.2f}, {self._push_target[2]:.2f})"
+                            )
                 else:
                     # No waypoint path yet: hold and keep refining the target.
                     self._pos["x"] = est["x"]
@@ -1151,6 +1203,10 @@ class FPVWindow(QtWidgets.QWidget):
                 self._search_scan_yaw = float(est["yaw"])
                 self._last_seen_time = None
                 self._state_t0 = now
+                if DEBUG_CONTROL:
+                    print(
+                        f"[CTRL] PUSH complete -> SEARCH gates_passed={self._gates_passed}"
+                    )
 
         # Always stream setpoints; only major-command transitions are locked.
         self._pos["z"] = float(np.clip(self._pos["z"], MIN_HEIGHT, MAX_HEIGHT))
