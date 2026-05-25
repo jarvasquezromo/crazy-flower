@@ -221,6 +221,9 @@ GATE_PHYS_H    = 0.4                 # metres, physical gate height — the only
 GATE_BORDER_MARGIN     = 5          # px; reject gates whose corners touch the frame edge
 VERT_PAIR_RESIDUAL_MAX = 0.05        # m; max residual of the vertical-edge metric solve
 PASS_AREA_FRAC = 0.20                # gate bbox / image area threshold → gate passed
+VISION_STALE_S = 0.5                 # s; treat the video feed as lost if no new frame
+                                     # arrives within this window (avoids servoing /
+                                     # committing on a frozen image)
 CHASE_TIMEOUT  = 8.0                 # seconds before giving up and returning to SEARCH
 SEARCH_CONFIRM_FRAMES = 10            # consecutive in-zone detections required before
                                      # locking on (their snapped positions are averaged)
@@ -566,7 +569,11 @@ class FPVWindow(QtWidgets.QWidget):
         self._gates_passed = 0
         self._vision_lock = threading.Lock()
         self._vision = {"found": False, "ex": 0.0, "ey": 0.0, "bbox": None, "area": 0.0}
+        self._vision_seq = 0           # bumped once per processed camera frame
+        self._vision_ts = 0.0          # monotonic time of the last processed frame
+        self._last_vision_seq = -1     # last frame seq the control loop consumed
 
+        self._connected_ok = False     # link up + commander safe to drive
         self._last_ctrl_time = time.monotonic()
 
         cflib.crtp.init_drivers()
@@ -608,6 +615,8 @@ class FPVWindow(QtWidgets.QWidget):
                 "corners": det.get("corners", None),
                 "candidates": det.get("candidates", []),
             }
+            self._vision_seq += 1
+            self._vision_ts = time.monotonic()
 
         # Debug overlay on the RGB image: candidates thin/yellow, selected thick/green.
         disp = color.copy()
@@ -669,6 +678,11 @@ class FPVWindow(QtWidgets.QWidget):
         dt = float(np.clip(now - self._last_ctrl_time, 0.02, 0.3))
         self._last_ctrl_time = now
 
+        # Do not drive the commander (or run the takeoff logic on zeroed state)
+        # until the link is actually up.
+        if not self._connected_ok:
+            return
+
         if self._gate_state == "STOP":
             # Safety brake: command zero velocity (hold in place, no motion).
             # Keep streaming so the firmware command watchdog stays satisfied.
@@ -683,8 +697,21 @@ class FPVWindow(QtWidgets.QWidget):
             area    = float(self._vision.get("area", 0.0))
             corners = self._vision.get("corners", None)
             candidates = list(self._vision.get("candidates", []))
+            vis_seq = self._vision_seq
+            vis_ts = self._vision_ts
         with self._pos_lock:
             est = dict(self._est)
+
+        # The control loop runs at 50 Hz but camera frames arrive much slower, so
+        # only advance frame-based debounce counters (SEARCH lock-on, PUSH commit,
+        # area-stall) when a genuinely NEW frame has been processed — otherwise a
+        # single repeated frame would satisfy a multi-frame confirmation. Also
+        # treat a frozen/stale feed as "no detection" so we never servo or commit
+        # on old pixels.
+        new_frame = (vis_seq != self._last_vision_seq)
+        self._last_vision_seq = vis_seq
+        if (now - vis_ts) > VISION_STALE_S:
+            found = False
 
         # Refresh the top-down map: drone pose, current estimate, target gate.
         target_gate = min(self._gates_passed + 1, MAX_GATES)
@@ -729,31 +756,36 @@ class FPVWindow(QtWidgets.QWidget):
             # Yaw in place; only lock on if the detection's world estimate snaps
             # into the expected gate's zone (rejects stray bright blobs).
             yaw_cmd = SEARCH_YAWRATE
-            snapped = None
-            if found and bbox is not None:
-                gw = self._gate_to_world(corners)
-                if gw is not None:
-                    gate_idx = self._gates_passed + 1
-                    snapped = self._zone_map.validate_and_snap(gw, gate_idx)
-                    self._last_est_gate = gw
-                    self._last_est_in_zone = snapped is not None
+            # Only evaluate detections on a new frame: the confirmation streak
+            # must count distinct frames, and averaging repeated frames would bias
+            # the locked position.
+            if new_frame:
+                snapped = None
+                if found and bbox is not None:
+                    gw = self._gate_to_world(corners)
+                    if gw is not None:
+                        gate_idx = self._gates_passed + 1
+                        snapped = self._zone_map.validate_and_snap(gw, gate_idx)
+                        self._last_est_gate = gw
+                        self._last_est_in_zone = snapped is not None
 
-            # Require SEARCH_CONFIRM_FRAMES *consecutive* in-zone detections, then
-            # lock on their average — rejects one-off noisy/false estimates. Any
-            # miss (no gate, bad geometry, out of zone) resets the streak.
-            if snapped is not None:
-                self._search_confirm.append(snapped)
-                if len(self._search_confirm) >= SEARCH_CONFIRM_FRAMES:
-                    avg = tuple(np.mean(np.asarray(self._search_confirm, dtype=np.float64), axis=0))
+                # Require SEARCH_CONFIRM_FRAMES *consecutive* in-zone detections,
+                # then lock on their average — rejects one-off noisy/false
+                # estimates. Any miss (no gate, bad geometry, out of zone) resets
+                # the streak.
+                if snapped is not None:
+                    self._search_confirm.append(snapped)
+                    if len(self._search_confirm) >= SEARCH_CONFIRM_FRAMES:
+                        avg = tuple(np.mean(np.asarray(self._search_confirm, dtype=np.float64), axis=0))
+                        self._search_confirm = []
+                        self._gate_world = avg
+                        self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
+                        self._chase_best_area_frac = 0.0
+                        self._chase_area_stall = 0
+                        self._gate_state = "CHASE"
+                        self._state_t0 = now
+                else:
                     self._search_confirm = []
-                    self._gate_world = avg
-                    self._last_chase_gate_pose = (est['x'], est['y'], self.hover['height'])
-                    self._chase_best_area_frac = 0.0
-                    self._chase_area_stall = 0
-                    self._gate_state = "CHASE"
-                    self._state_t0 = now
-            else:
-                self._search_confirm = []
 
         elif self._gate_state == "CHASE":
             if (now - self._state_t0) > CHASE_TIMEOUT:
@@ -794,7 +826,7 @@ class FPVWindow(QtWidgets.QWidget):
                     # the frame at close range (no usable projection) trust the
                     # current detection for the final approach; otherwise it is a
                     # foreign-zone gate -> ignore it and hold.
-                    primary_gw = self._gate_to_world(corners)
+                    primary_gw = self._gate_to_world(corners, verbose=False)
                     if found and primary_gw is None and (area / img_area) > 0.5 * PASS_AREA_FRAC:
                         ex_t, ey_t, area_t = ex, ey, area
                         self._last_est_in_zone = None
@@ -825,12 +857,20 @@ class FPVWindow(QtWidgets.QWidget):
                     centred = (abs(ex_t) <= APPROACH_TOL_X) and (abs(ey_err) <= APPROACH_TOL_Y)
 
                     # Commit to PUSH only after the gate is BIG and CENTRED for a
-                    # few consecutive frames (robust against one-off area spikes).
-                    if area_frac > self._chase_best_area_frac + PUSH_AREA_GROWTH_EPS:
-                        self._chase_best_area_frac = area_frac
-                        self._chase_area_stall = 0
-                    else:
-                        self._chase_area_stall += 1
+                    # few consecutive *frames* (robust against one-off area
+                    # spikes). These counters advance per frame, not per control
+                    # tick, so the *_FRAMES thresholds mean real frames.
+                    if new_frame:
+                        if area_frac > self._chase_best_area_frac + PUSH_AREA_GROWTH_EPS:
+                            self._chase_best_area_frac = area_frac
+                            self._chase_area_stall = 0
+                        else:
+                            self._chase_area_stall += 1
+
+                        if centred and (area_frac > PASS_AREA_FRAC):
+                            self._push_confirm += 1
+                        else:
+                            self._push_confirm = 0
 
                     fallback_push = (
                         abs(ey_err) <= APPROACH_TOL_Y
@@ -838,11 +878,6 @@ class FPVWindow(QtWidgets.QWidget):
                         area_frac >= PUSH_FALLBACK_AREA_FRAC
                         and self._chase_area_stall >= PUSH_AREA_STALL_FRAMES
                     )
-
-                    if centred and (area_frac > PASS_AREA_FRAC):
-                        self._push_confirm += 1
-                    else:
-                        self._push_confirm = 0
 
                     if self._push_confirm >= PASS_CONFIRM_FRAMES or fallback_push:
                         self._push_confirm = 0
@@ -1154,6 +1189,7 @@ class FPVWindow(QtWidgets.QWidget):
         # position estimate. Just start logging and take off.
         self._set_status(f'Connected to {uri}')
         self._setup_log()
+        self._connected_ok = True
 
     def _disconnected(self, uri):
         print('Disconnected')
