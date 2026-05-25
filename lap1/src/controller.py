@@ -19,18 +19,20 @@ from .constants import URI_DEFAULT
 from .debug_window import DebugWindow
 from .detection import detect_green_gate
 from .gate_map import GateMapWidget
+from .recorder import Recorder
 from .state_machine import GateStateMachine
-from .video import UdpVideoThread, VideoFileThread
+from .video import UdpVideoThread, VideoFileThread, ReplayThread
 
 warnings.filterwarnings('ignore', message='.*TYPE_HOVER_LEGACY.*')
 warnings.filterwarnings('ignore', message='.*supervisor subsystem requires CRTP.*')
 
 
 class FPVWindow(QtWidgets.QWidget):
-    def __init__(self, video_path=None):
+    def __init__(self, video_path=None, replay_dir=None):
         super().__init__()
         self.setWindowTitle('Crazyflie FPV')
         self._simulation = video_path is not None
+        self._replay = replay_dir is not None
 
         # Calibration
         self._base_calib = load_calibration()
@@ -67,8 +69,11 @@ class FPVWindow(QtWidgets.QWidget):
         self._debug_window.params_changed.connect(self._on_debug_params)
         self._debug_window.hide()
 
+        # Recorder
+        self._recorder = Recorder()
+
         # Crazyflie
-        if not self._simulation:
+        if not self._simulation and not self._replay:
             cflib.crtp.init_drivers()
             URI = uri_helper.uri_from_env(default=URI_DEFAULT)
 
@@ -88,7 +93,10 @@ class FPVWindow(QtWidgets.QWidget):
             self._sm.log_ready = True
 
         # Video source
-        if self._simulation:
+        if self._replay:
+            self.video = ReplayThread(replay_dir, loop=False, parent=self)
+            self.video.pose_ready.connect(self._on_replay_pose)
+        elif self._simulation:
             self.video = VideoFileThread(video_path, loop=True, parent=self)
         else:
             self.video = UdpVideoThread(self._img_w, self._img_h, parent=self)
@@ -124,6 +132,10 @@ class FPVWindow(QtWidgets.QWidget):
     def _update_image(self, img):
         color_0 = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB) if img.ndim == 2 else img
         color = undistort_image(color_0, self._cam_mtx, self._dist_coeffs)
+
+        # Record frame
+        if self._recorder.recording:
+            self._recorder.save_frame(color)
 
         # When debug window is paused, just buffer the frame and skip processing
         if self._debug_window.isVisible() and self._debug_window.paused:
@@ -204,6 +216,17 @@ class FPVWindow(QtWidgets.QWidget):
                 self.cf.commander.send_stop_setpoint()
             self._timer.stop()
 
+    # ─── Replay pose callback ────────────────────────────────────────────
+
+    def _on_replay_pose(self, x, y, z, yaw):
+        with self._sm.pos_lock:
+            self._sm.est['x'] = x
+            self._sm.est['y'] = y
+            self._sm.est['z'] = z
+            self._sm.est['yaw'] = yaw
+            if not self._sm.log_ready:
+                self._sm.seed_position(x, y, z, yaw)
+
     # ─── Debug params callback ──────────────────────────────────────────
 
     def _on_debug_params(self, params):
@@ -225,6 +248,13 @@ class FPVWindow(QtWidgets.QWidget):
         if k == QtCore.Qt.Key.Key_D:     self._sm.pos['yaw'] += 15.0
         if k == QtCore.Qt.Key.Key_Escape:
             self._sm.state = "STOP"
+        if k == QtCore.Qt.Key.Key_R:
+            if self._recorder.recording:
+                self._recorder.stop()
+                self.status_label.setText("Recording stopped")
+            else:
+                self._recorder.start()
+                self.status_label.setText("● Recording...")
         if k == QtCore.Qt.Key.Key_G:
             if self._debug_window.isVisible():
                 self._debug_window.hide()
@@ -275,6 +305,10 @@ class FPVWindow(QtWidgets.QWidget):
                 self._sm.seed_position(
                     self._sm.est['x'], self._sm.est['y'],
                     self._sm.est['z'], self._sm.est['yaw'])
+        if self._recorder.recording:
+            self._recorder.save_pose(
+                data['stateEstimate.x'], data['stateEstimate.y'],
+                data['stateEstimate.z'], data['stabilizer.yaw'])
 
     def _on_battery(self, _ts, data, _lc):
         vbat = data['pm.vbat']
@@ -288,6 +322,8 @@ class FPVWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         self._timer.stop()
+        if self._recorder.recording:
+            self._recorder.stop()
         if self.cf:
             if hasattr(self, '_log_cfg'):
                 self._log_cfg.stop()

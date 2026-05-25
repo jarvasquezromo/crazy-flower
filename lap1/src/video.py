@@ -146,3 +146,102 @@ class VideoFileThread(QtCore.QThread):
             self.msleep(delay_ms)
 
         cap.release()
+
+
+class ReplayThread(QtCore.QThread):
+    """Replays a recorded session (frames + pose) in sync.
+
+    Emits frames at their original timestamps and pose updates at ~50Hz,
+    interpolated from the pose log. The controller receives pose via
+    pose_ready and frames via frame_ready, just like the live sources.
+    """
+    frame_ready = QtCore.pyqtSignal(np.ndarray)
+    size_detected = QtCore.pyqtSignal(int, int)
+    pose_ready = QtCore.pyqtSignal(float, float, float, float)  # x, y, z, yaw
+
+    POSE_TICK_MS = 20  # 50 Hz pose emission
+
+    def __init__(self, rec_dir, loop=False, parent=None):
+        super().__init__(parent)
+        self._rec_dir = rec_dir
+        self._loop = loop
+
+    def run(self):
+        import csv as _csv
+        import time as _time
+
+        rec = self._rec_dir
+
+        # Load frames index
+        frames = []
+        with open(os.path.join(rec, "frames.csv")) as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                frames.append((float(row["t"]), row["filename"]))
+        if not frames:
+            print(f"[Replay] No frames in {rec}")
+            return
+
+        # Load pose log
+        poses = []
+        with open(os.path.join(rec, "pose.csv")) as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                poses.append((float(row["t"]), float(row["x"]),
+                              float(row["y"]), float(row["z"]), float(row["yaw"])))
+
+        pose_times = np.array([p[0] for p in poses])
+        pose_data = np.array([[p[1], p[2], p[3], p[4]] for p in poses])
+
+        # Emit size from first frame
+        first_path = os.path.join(rec, "frames", frames[0][1])
+        first_img = cv2.imread(first_path)
+        if first_img is not None:
+            h, w = first_img.shape[:2]
+            self.size_detected.emit(w, h)
+
+        total_duration = max(frames[-1][0], pose_times[-1] if len(pose_times) else 0)
+
+        while True:
+            t0_real = _time.monotonic()
+            frame_idx = 0
+            next_frame_t = frames[0][0] if frames else float('inf')
+
+            t_sim = 0.0
+            while t_sim <= total_duration:
+                # Emit pose (interpolated)
+                if len(pose_times) > 0:
+                    xyzw = self._interp_pose(t_sim, pose_times, pose_data)
+                    self.pose_ready.emit(xyzw[0], xyzw[1], xyzw[2], xyzw[3])
+
+                # Emit frame if its timestamp has arrived
+                while frame_idx < len(frames) and t_sim >= frames[frame_idx][0]:
+                    fpath = os.path.join(rec, "frames", frames[frame_idx][1])
+                    img = cv2.imread(fpath)
+                    if img is not None:
+                        if img.ndim == 3:
+                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        self.frame_ready.emit(img)
+                    frame_idx += 1
+
+                # Wait real-time tick
+                self.msleep(self.POSE_TICK_MS)
+                t_sim = _time.monotonic() - t0_real
+
+            if not self._loop:
+                break
+
+    @staticmethod
+    def _interp_pose(t, times, data):
+        """Linearly interpolate pose at time t."""
+        if t <= times[0]:
+            return data[0]
+        if t >= times[-1]:
+            return data[-1]
+        idx = np.searchsorted(times, t, side='right') - 1
+        idx = min(idx, len(times) - 2)
+        dt = times[idx + 1] - times[idx]
+        if dt < 1e-9:
+            return data[idx]
+        alpha = (t - times[idx]) / dt
+        return data[idx] * (1 - alpha) + data[idx + 1] * alpha
