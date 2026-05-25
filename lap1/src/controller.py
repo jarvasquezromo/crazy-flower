@@ -16,6 +16,7 @@ from cflib.drivers.crazyradio import _find_devices
 
 from .calibration import load_calibration, scaled_calibration, camera_matrix, undistort_image
 from .constants import URI_DEFAULT
+from .debug_window import DebugWindow
 from .detection import detect_green_gate
 from .gate_map import GateMapWidget
 from .state_machine import GateStateMachine
@@ -41,8 +42,6 @@ class FPVWindow(QtWidgets.QWidget):
         # UI
         self.image_label = QtWidgets.QLabel()
         self.status_label = QtWidgets.QLabel('Connecting...')
-        self.debug_label = QtWidgets.QLabel()
-        self.debug_label.setWindowTitle('Debug Mask')
         self.map_widget = GateMapWidget(parent=self)
 
         layout = QtWidgets.QHBoxLayout()
@@ -60,6 +59,13 @@ class FPVWindow(QtWidgets.QWidget):
         self._battery_v = None
         self._show_mask = False
         self._debug_mask = None  # stored from video thread, displayed from main thread
+        self._det_params = None  # None = use defaults from constants
+
+        # Debug window
+        self._debug_window = DebugWindow(
+            cam_cx=float(self._calib['cx']), cam_cy=float(self._calib['cy']))
+        self._debug_window.params_changed.connect(self._on_debug_params)
+        self._debug_window.hide()
 
         # Crazyflie
         if not self._simulation:
@@ -119,7 +125,13 @@ class FPVWindow(QtWidgets.QWidget):
         color_0 = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB) if img.ndim == 2 else img
         color = undistort_image(color_0, self._cam_mtx, self._dist_coeffs)
 
-        det = detect_green_gate(color, float(self._calib['cx']), float(self._calib['cy']))
+        # When debug window is paused, just buffer the frame and skip processing
+        if self._debug_window.isVisible() and self._debug_window.paused:
+            self._debug_window.push_frame(color)
+            return
+
+        det = detect_green_gate(color, float(self._calib['cx']), float(self._calib['cy']),
+                               params=self._det_params)
         with self._vision_lock:
             self._vision = {
                 "found": bool(det.get("found", False)),
@@ -129,6 +141,10 @@ class FPVWindow(QtWidgets.QWidget):
                 "area": float(det.get("area", 0.0)),
                 "corners": det.get("corners"),
             }
+
+        # Feed debug window
+        if self._debug_window.isVisible():
+            self._debug_window.push_frame(color)
 
         # Overlay
         disp = color.copy()
@@ -188,18 +204,10 @@ class FPVWindow(QtWidgets.QWidget):
                 self.cf.commander.send_stop_setpoint()
             self._timer.stop()
 
-        # Show debug mask window from main thread
-        if self._show_mask and self._debug_mask is not None:
-            ch = self._debug_mask.shape[2] if self._debug_mask.ndim == 3 else 1
-            m = self._debug_mask
-            mh, mw = m.shape[:2]
-            qi = QtGui.QImage(m.data, mw, mh, mw * ch, QtGui.QImage.Format.Format_RGB888)
-            # qi = QtGui.QImage(m.data, mw, mh, mw, QtGui.QImage.Format.Format_Grayscale8)
-            self.debug_label.setPixmap(QtGui.QPixmap.fromImage(qi.scaled(mw * 2, mh * 2)))
-            if not self.debug_label.isVisible():
-                self.debug_label.show()
-        elif not self._show_mask and self.debug_label.isVisible():
-            self.debug_label.hide()
+    # ─── Debug params callback ──────────────────────────────────────────
+
+    def _on_debug_params(self, params):
+        self._det_params = params
 
     # ─── Keyboard ────────────────────────────────────────────────────────
 
@@ -217,8 +225,11 @@ class FPVWindow(QtWidgets.QWidget):
         if k == QtCore.Qt.Key.Key_D:     self._sm.pos['yaw'] += 15.0
         if k == QtCore.Qt.Key.Key_Escape:
             self._sm.state = "STOP"
-        if k == QtCore.Qt.Key.Key_M:
-            self._show_mask = not self._show_mask
+        if k == QtCore.Qt.Key.Key_G:
+            if self._debug_window.isVisible():
+                self._debug_window.hide()
+            else:
+                self._debug_window.show()
         if k == QtCore.Qt.Key.Key_Space:
             self._sm.state = "DONE"
             if self.cf:

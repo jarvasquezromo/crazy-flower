@@ -48,6 +48,7 @@ class GateStateMachine:
 
     def _reset_gate_tracking(self):
         """Clear gate observations and triangulator buffer."""
+        self._gate_obs = []
         if hasattr(self, "_triangulator") and self._triangulator is not None:
             self._triangulator.reset()
 

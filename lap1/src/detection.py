@@ -73,18 +73,34 @@ def _gate_candidate(cnt, img_w, img_h, cam_cx, cam_cy):
     }
 
 
-def detect_green_gate(rgb_img, cam_cx, cam_cy):
-    """Detect gate(s). Returns dict with best candidate (rightmost cx)."""
+def detect_green_gate(rgb_img, cam_cx, cam_cy, *, params=None):
+    """Detect gate(s). Returns dict with best candidate (rightmost cx).
+
+    If `params` is provided, uses those values instead of the module constants.
+    Keys: h_lo, h_hi, s_lo, s_hi, v_lo, v_hi, min_v, kernel, min_area_frac.
+    """
     h, w = rgb_img.shape[:2]
     hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
-    mask_1 = cv2.inRange(hsv, GREEN_HSV_LO, GREEN_HSV_HI)
 
-    if GREEN_MIN_V is not None:
-        v_mask = np.where(hsv[:, :, 2] >= int(GREEN_MIN_V), np.uint8(255), np.uint8(0))
-        mask = cv2.bitwise_and(mask_1, v_mask)
+    if params is not None:
+        hsv_lo = np.array([params["h_lo"], params["s_lo"], params["v_lo"]], dtype=np.uint8)
+        hsv_hi = np.array([params["h_hi"], params["s_hi"], params["v_hi"]], dtype=np.uint8)
+        min_v = params.get("min_v", GREEN_MIN_V)
+        kernel_size = params.get("kernel", 5)
+        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    else:
+        hsv_lo, hsv_hi = GREEN_HSV_LO, GREEN_HSV_HI
+        min_v = GREEN_MIN_V
+        kernel = MORPH_KERNEL
 
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL, iterations=3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL, iterations=1)
+    mask_raw = cv2.inRange(hsv, hsv_lo, hsv_hi)
+
+    if min_v is not None:
+        v_mask = np.where(hsv[:, :, 2] >= int(min_v), np.uint8(255), np.uint8(0))
+        mask_raw = cv2.bitwise_and(mask_raw, v_mask)
+
+    mask = cv2.morphologyEx(mask_raw, cv2.MORPH_CLOSE, kernel, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates = []
@@ -93,12 +109,15 @@ def detect_green_gate(rgb_img, cam_cx, cam_cy):
         if cand is not None:
             candidates.append(cand)
 
+    stages = {"hsv": hsv, "mask_raw": mask_raw, "mask": mask}
+
     if not candidates:
-        return {"found": False, "mask": rgb_img, "candidates": []}
+        return {"found": False, "mask": mask, "candidates": [], "stages": stages}
 
     # TODO: select the one its in the section that we are loking for
     best = dict(max(candidates, key=lambda c: c["cx"]))
     best["mask"] = mask
     best["candidates"] = candidates
     best["n_candidates"] = len(candidates)
+    best["stages"] = stages
     return best

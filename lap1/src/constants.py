@@ -14,9 +14,9 @@ IMG_HEADER_SIZE = 11
 MIN_JPEG_BYTES = 5000
 
 # --- Gate detection / HSV ---
-GREEN_HSV_LO = np.array([35, 50, 50], dtype=np.uint8)
-GREEN_HSV_HI = np.array([85, 255, 255], dtype=np.uint8)
-GREEN_MIN_V = 240
+GREEN_HSV_LO = np.array([25, 0, 0], dtype=np.uint8)
+GREEN_HSV_HI = np.array([118, 73, 255], dtype=np.uint8)
+GREEN_MIN_V = 181
 
 MIN_GREEN_AREA_FRAC = 0.01
 CENTER_TOL_X = 0.10
