@@ -11,7 +11,7 @@ import numpy as np
 class Recorder:
     """Saves timestamped JPEG frames and pose CSV to a dated folder."""
 
-    def __init__(self, base_dir="lap1/recordings"):
+    def __init__(self, base_dir="recordings"):
         self._base_dir = base_dir
         self._recording = False
         self._dir = None
