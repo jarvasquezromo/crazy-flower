@@ -60,7 +60,10 @@ GATE_ASPECT_MAX = 2.2
 GATE_MIN_SOLIDITY = 0.80
 GATE_APPROX_EPS = 0.04
 
-SEARCH_YAWRATE = 18.0
+SEARCH_YAWRATE = 10.0
+SEARCH_SWEEP_LIMIT_DEG = 90.0
+START_BACKUP_DISTANCE_M = 0.35
+START_BACKUP_MAX_SPEED = 0.12
 RECOVER_YAWRATE = 12.0
 APPROACH_TIMEOUT_S = 4.0
 RECOVER_DURATION_S = 1.0
@@ -413,6 +416,9 @@ class FPVWindow(QtWidgets.QWidget):
         self._last_seen_t = 0.0
         self._approach_target = None
         self._gate_heading_deg = 0.0
+        self._backup_target = None
+        self._search_anchor_yaw = None
+        self._search_yaw_dir = 1.0
         self._recover_until = 0.0
         self._initial_z = 0.0
         self._max_xy_speed = MAX_XY_SPEED
@@ -598,16 +604,55 @@ class FPVWindow(QtWidgets.QWidget):
             return
 
         if self._state == "WAIT":
+            heading_rad = np.deg2rad(float(est["yaw"]))
             self._pos["x"] = est["x"]
             self._pos["y"] = est["y"]
             self._initial_z = float(est["z"])
             self._pos["z"] = self._initial_z
             self._pos["yaw"] = float(est["yaw"])
-            self._state = "SEARCH"
+            self._backup_target = np.array(
+                [
+                    est["x"] - START_BACKUP_DISTANCE_M * np.cos(heading_rad),
+                    est["y"] - START_BACKUP_DISTANCE_M * np.sin(heading_rad),
+                    self._initial_z,
+                    est["yaw"],
+                ],
+                dtype=float,
+            )
+            self._state = "BACKUP"
             self._state_t0 = now
 
+        if self._state == "BACKUP":
+            if self._backup_target is None:
+                self._state = "SEARCH"
+            else:
+                self._max_xy_speed = START_BACKUP_MAX_SPEED
+                self._ramp_position(self._backup_target, dt)
+                self._pos["yaw"] = float(self._backup_target[3])
+
+                if self._distance_to_target(self._backup_target) <= 0.05:
+                    self._backup_target = None
+                    self._search_anchor_yaw = float(self._pos["yaw"])
+                    self._search_yaw_dir = 1.0
+                    self._state = "SEARCH"
+                    self._state_t0 = now
+
         if self._state == "SEARCH":
-            self._pos["yaw"] = wrap_deg(self._pos["yaw"] + SEARCH_YAWRATE * dt)
+            if self._search_anchor_yaw is None:
+                self._search_anchor_yaw = float(self._pos["yaw"])
+
+            relative_yaw = wrap_deg(self._pos["yaw"] - self._search_anchor_yaw)
+            next_relative_yaw = (
+                relative_yaw + self._search_yaw_dir * SEARCH_YAWRATE * dt
+            )
+            if next_relative_yaw >= SEARCH_SWEEP_LIMIT_DEG:
+                next_relative_yaw = SEARCH_SWEEP_LIMIT_DEG
+                self._search_yaw_dir = -1.0
+            elif next_relative_yaw <= -SEARCH_SWEEP_LIMIT_DEG:
+                next_relative_yaw = -SEARCH_SWEEP_LIMIT_DEG
+                self._search_yaw_dir = 1.0
+
+            self._pos["yaw"] = wrap_deg(self._search_anchor_yaw + next_relative_yaw)
             self._pos["x"] = est["x"]
             self._pos["y"] = est["y"]
             self._pos["z"] = self._initial_z
@@ -639,6 +684,8 @@ class FPVWindow(QtWidgets.QWidget):
             elif now - self._last_seen_t > APPROACH_TIMEOUT_S:
                 print("[CTRL] APPROACH timeout -> SEARCH", flush=True)
                 self._approach_target = None
+                self._search_anchor_yaw = float(self._pos["yaw"])
+                self._search_yaw_dir = 1.0
                 self._state = "SEARCH"
                 self._state_t0 = now
                 self.cf.commander.send_position_setpoint(
@@ -675,8 +722,12 @@ class FPVWindow(QtWidgets.QWidget):
                     self.cf.commander.send_stop_setpoint()
                     self._timer.stop()
                     return
+                self._search_anchor_yaw = float(self._pos["yaw"])
+                self._search_yaw_dir = 1.0
                 self._state = "SEARCH"
                 self._state_t0 = now
+
+        self._max_xy_speed = MAX_XY_SPEED
 
         self.cf.commander.send_position_setpoint(
             float(self._pos["x"]),
