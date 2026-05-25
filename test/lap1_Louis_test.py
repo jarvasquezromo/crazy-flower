@@ -199,6 +199,7 @@ APPROACH_TARGET_EY = (
     0.16  # positive: hold gate below image centre -> fly slightly higher
 )
 PASS_CONFIRM_FRAMES = 5  # consecutive big-and-centred frames before committing to PUSH
+CHASE_CENTER_CONFIRM_FRAMES = 3  # consecutive centred frames before starting approach
 PASS_THROUGH_DIST = 1.2  # meters of forward travel in PUSH (distance-based, not time)
 PUSH_MAX_DURATION = 10.0  # seconds, PUSH safety timeout if travel never reached
 PUSH_FALLBACK_AREA_FRAC = 0.10  # push if CHASE stalls after reaching this area fraction
@@ -606,6 +607,7 @@ class FPVWindow(QtWidgets.QWidget):
         self._gate_wp_idx = 0  # current waypoint index along _gate_waypoints
         self._last_est_gate = None  # last raw vision estimate (for the map)
         self._last_est_in_zone = None  # whether it passed the zone check
+        self._chase_center_confirm = 0  # centred frames before CHASE approach
         self._search_confirm = (
             []
         )  # snapped (x,y,z) of consecutive in-zone hits in SEARCH
@@ -823,16 +825,25 @@ class FPVWindow(QtWidgets.QWidget):
                 self._state_t0 = now
 
         elif self._gate_state == "SEARCH":
-            # Yaw in place; only lock on if the detection's world estimate snaps
-            # into the expected gate's zone (rejects stray bright blobs).
+            # Yaw in place; only lock on if a candidate is really inside the
+            # expected gate zone. Use a strict zone test here so a later gate
+            # cannot be accepted early just because its estimate sits near a
+            # zone boundary.
             snapped = None
-            if found and bbox is not None:
-                gw = self._gate_to_world(corners)
-                if gw is not None:
-                    gate_idx = self._gates_passed + 1
+            gate_idx = self._gates_passed + 1
+            sel = self._select_target_candidate(candidates, gate_idx) if found else None
+            if sel is not None:
+                cand, snapped = sel
+                gw = self._gate_to_world(cand.get("corners"), verbose=False)
+                if gw is not None and self._zone_map.in_zone(
+                    gw[0], gw[1], gate_idx, margin_deg=0.0
+                ):
                     snapped = self._zone_map.validate_and_snap(gw, gate_idx)
                     self._last_est_gate = gw
                     self._last_est_in_zone = snapped is not None
+                else:
+                    snapped = None
+                    self._last_est_in_zone = False
 
             # Require SEARCH_CONFIRM_FRAMES *consecutive* in-zone detections, then
             # lock on their average — rejects one-off noisy/false estimates. Any
@@ -849,6 +860,7 @@ class FPVWindow(QtWidgets.QWidget):
                     self._gate_world = avg
                     self._gate_waypoints = self._build_traj(avg)
                     self._gate_wp_idx = 0
+                    self._chase_center_confirm = 0
                     self._last_chase_gate_pose = (est["x"], est["y"], self._pos["z"])
                     self._chase_best_area_frac = 0.0
                     self._chase_area_stall = 0
@@ -871,6 +883,7 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gate_world = None
                 self._push_confirm = 0
                 self._last_chase_gate_pose = None
+                self._chase_center_confirm = 0
                 self._chase_best_area_frac = 0.0
                 self._chase_area_stall = 0
                 self._recover_height = self._pos["z"]
@@ -928,6 +941,7 @@ class FPVWindow(QtWidgets.QWidget):
                             )
                             self._last_replan_time = now
                             self._wp_settle_until = now + WAYPOINT_SETTLE_S
+                            self._chase_center_confirm = 0
                     # record the time we last saw a usable target
                     self._last_seen_time = now
                 else:
@@ -957,20 +971,64 @@ class FPVWindow(QtWidgets.QWidget):
 
                 if self._gate_waypoints:
                     wp = self._gate_waypoints[self._gate_wp_idx]
-                    self._pos["x"], self._pos["y"], self._pos["z"] = wp
                     if self._gate_world is not None:
                         gx, gy, _ = self._gate_world
-                        self._pos["yaw"] = float(
+                        gate_yaw = float(
                             np.degrees(np.arctan2(gy - est["y"], gx - est["x"]))
                         )
-                    dist_wp = float(np.hypot(est["x"] - wp[0], est["y"] - wp[1]))
-                    if (
-                        dist_wp < WAYPOINT_TOL
-                        and now >= self._wp_settle_until
-                        and self._gate_wp_idx < len(self._gate_waypoints) - 1
-                    ):
-                        self._gate_wp_idx += 1
-                        self._wp_settle_until = now + WAYPOINT_SETTLE_S
+                    else:
+                        gate_yaw = est["yaw"]
+
+                    centered = (
+                        abs(ex) <= APPROACH_TOL_X
+                        and abs(ey - float(APPROACH_TARGET_EY)) <= APPROACH_TOL_Y
+                    )
+                    if centered:
+                        self._chase_center_confirm += 1
+                    else:
+                        self._chase_center_confirm = 0
+
+                    if self._chase_center_confirm < CHASE_CENTER_CONFIRM_FRAMES:
+                        # Pre-approach centering stage: hold position, trim yaw
+                        # toward the gate and adjust height gently, but do not
+                        # advance toward the gate yet.
+                        yaw_r = np.deg2rad(est["yaw"])
+                        left_x = -np.sin(yaw_r)
+                        left_y = np.cos(yaw_r)
+                        lateral_step = float(
+                            np.clip(
+                                -K_LATERAL * ex * dt,
+                                -MAX_LATERAL * dt,
+                                MAX_LATERAL * dt,
+                            )
+                        )
+                        self._pos["x"] = float(est["x"] + lateral_step * left_x)
+                        self._pos["y"] = float(est["y"] + lateral_step * left_y)
+                        self._pos["yaw"] = float(
+                            np.clip(est["yaw"] - K_YAW * ex * dt, -180.0, 180.0)
+                        )
+                        z_trim = float(
+                            np.clip(
+                                K_HEIGHT * (float(APPROACH_TARGET_EY) - ey) * dt,
+                                -0.06,
+                                0.06,
+                            )
+                        )
+                        self._pos["z"] = float(
+                            np.clip(est["z"] + z_trim, MIN_HEIGHT, MAX_HEIGHT)
+                        )
+                    else:
+                        # Centered: now approach gently via the world-frame waypoints.
+                        self._pos["x"], self._pos["y"], self._pos["z"] = wp
+                        self._pos["yaw"] = gate_yaw
+                        dist_wp = float(np.hypot(est["x"] - wp[0], est["y"] - wp[1]))
+                        if (
+                            dist_wp < WAYPOINT_TOL
+                            and now >= self._wp_settle_until
+                            and self._gate_wp_idx < len(self._gate_waypoints) - 1
+                        ):
+                            self._gate_wp_idx += 1
+                            self._wp_settle_until = now + WAYPOINT_SETTLE_S
                     area_frac = area / img_area if img_area > 0 else 0.0
                     if area_frac > PASS_AREA_FRAC:
                         yaw_r = np.deg2rad(est["yaw"])
@@ -997,18 +1055,32 @@ class FPVWindow(QtWidgets.QWidget):
             sel = self._select_target_candidate(candidates, gate_idx) if found else None
             if sel is not None:
                 _cand, snapped = sel
-                self._gate_world = snapped
-                self._gate_waypoints = self._build_traj(snapped)
-                self._gate_wp_idx = 0
-                self._last_est_gate = snapped
-                self._last_est_in_zone = True
-                self._last_chase_gate_pose = (est["x"], est["y"], self._pos["z"])
-                self._chase_best_area_frac = 0.0
-                self._chase_area_stall = 0
-                self._gate_state = "CHASE"
-                self._state_t0 = now
-                self._wp_settle_until = now + WAYPOINT_SETTLE_S
-                self._last_replan_time = now
+                gw = self._gate_to_world(_cand.get("corners"), verbose=False)
+                if gw is not None and self._zone_map.in_zone(
+                    gw[0], gw[1], gate_idx, margin_deg=0.0
+                ):
+                    snapped = self._zone_map.validate_and_snap(gw, gate_idx)
+                    if snapped is not None:
+                        self._gate_world = snapped
+                        self._gate_waypoints = self._build_traj(snapped)
+                        self._gate_wp_idx = 0
+                        self._last_est_gate = snapped
+                        self._last_est_in_zone = True
+                        self._last_chase_gate_pose = (
+                            est["x"],
+                            est["y"],
+                            self._pos["z"],
+                        )
+                        self._chase_best_area_frac = 0.0
+                        self._chase_area_stall = 0
+                        self._gate_state = "CHASE"
+                        self._state_t0 = now
+                        self._wp_settle_until = now + WAYPOINT_SETTLE_S
+                        self._last_replan_time = now
+                    else:
+                        self._last_est_in_zone = False
+                else:
+                    self._last_est_in_zone = False
             else:
                 # Scan up, down, back to original height, then yaw right/left.
                 t = now - self._state_t0
@@ -1064,6 +1136,7 @@ class FPVWindow(QtWidgets.QWidget):
                 self._gates_passed += 1
                 self._gate_world = None
                 self._last_chase_gate_pose = None
+                self._chase_center_confirm = 0
                 self._chase_best_area_frac = 0.0
                 self._chase_area_stall = 0
                 self._gate_waypoints = []
